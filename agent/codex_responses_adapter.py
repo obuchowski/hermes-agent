@@ -911,7 +911,7 @@ def _preflight_codex_api_kwargs(
 
     allowed_keys = {
         "model", "instructions", "input", "tools", "store",
-        "reasoning", "include", "max_output_tokens", "temperature",
+        "reasoning", "include", "max_output_tokens", "temperature", "text",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
         "extra_headers", "extra_body", "timeout",
     }
@@ -949,6 +949,18 @@ def _preflight_codex_api_kwargs(
     temperature = api_kwargs.get("temperature")
     if isinstance(temperature, (int, float)):
         normalized["temperature"] = float(temperature)
+
+    if "text" in api_kwargs:
+        text_config = api_kwargs["text"]
+        if not isinstance(text_config, dict):
+            raise ValueError("Codex Responses request 'text' must be an object.")
+        if "verbosity" in text_config:
+            verbosity = text_config["verbosity"]
+            if verbosity not in {"low", "medium", "high"}:
+                raise ValueError(
+                    "Codex Responses request 'text.verbosity' must be low, medium, or high."
+                )
+        normalized["text"] = dict(text_config)
 
     # Pass through tool_choice, parallel_tool_calls, prompt_cache_key
     for passthrough_key in ("tool_choice", "parallel_tool_calls", "prompt_cache_key"):
