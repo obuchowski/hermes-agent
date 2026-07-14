@@ -43,6 +43,20 @@ def _bounded_prompt_cache_key(value: Any) -> Optional[str]:
     return key if len(key) <= 64 else "pck_" + hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
+_OPENAI_VERBOSITY_VALUES = frozenset({"low", "medium", "high"})
+
+
+def _configured_openai_verbosity() -> Optional[str]:
+    """Return the profile-scoped OpenAI Responses verbosity preference."""
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = str(get_env_value("HERMES_OPENAI_VERBOSITY") or "").strip().lower()
+    except Exception:
+        return None
+    return value if value in _OPENAI_VERBOSITY_VALUES else None
+
+
 def _bound_prompt_cache_key_field(container: Any) -> None:
     """Bound (or drop, when empty) an in-place ``prompt_cache_key`` entry."""
     if isinstance(container, dict) and "prompt_cache_key" in container:
@@ -728,6 +742,10 @@ class ResponsesApiTransport(ProviderTransport):
             ),
             "store": False,
         }
+        if is_codex_backend:
+            verbosity = _configured_openai_verbosity()
+            if verbosity:
+                kwargs["text"] = {"verbosity": verbosity}
         # ``tools`` MUST be omitted when empty: the openai SDK iterates it without a None guard.
         if response_tools:
             kwargs["tools"] = response_tools

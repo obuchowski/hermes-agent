@@ -940,7 +940,7 @@ _PREFLIGHT_OPTIONAL_FIELDS: tuple[tuple[str, Callable[[Any], bool], Optional[Cal
 )
 
 _PREFLIGHT_ALLOWED_KEYS = {
-    "model", "instructions", "input", "tools", "store", "extra_headers", "extra_body",
+    "model", "instructions", "input", "tools", "store", "text", "extra_headers", "extra_body",
     *(key for key, _, _ in _PREFLIGHT_OPTIONAL_FIELDS),
 }
 
@@ -984,6 +984,13 @@ def _preflight_codex_api_kwargs(
         value = api_kwargs.get(key)
         if accept(value):
             normalized[key] = coerce(value) if coerce else value
+    if "text" in api_kwargs:
+        text_config = _optional_dict(api_kwargs, "text") or {}
+        if "verbosity" in text_config:
+            verbosity = text_config["verbosity"]
+            if verbosity not in {"low", "medium", "high"}:
+                raise ValueError("Codex Responses request 'text.verbosity' must be low, medium, or high.")
+        normalized["text"] = dict(text_config)
     extra_headers = _optional_dict(api_kwargs, "extra_headers") or {}
     if not all(_nonblank(key) for key in extra_headers):
         raise ValueError("Codex Responses request 'extra_headers' keys must be non-empty strings.")

@@ -1655,6 +1655,49 @@ def test_preflight_codex_api_kwargs_rejects_function_call_output_without_call_id
         )
 
 
+
+
+
+
+
+
+
+
+
+
+
+@pytest.mark.parametrize("verbosity", ["low", "medium", "high"])
+def test_preflight_codex_api_kwargs_allows_text_verbosity(monkeypatch, verbosity):
+    _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["text"] = {"verbosity": verbosity}
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    result = _preflight_codex_api_kwargs(kwargs)
+    assert result["text"] == {"verbosity": verbosity}
+
+
+@pytest.mark.parametrize("verbosity", [None, "tiny", "LOW", 1, True])
+def test_preflight_codex_api_kwargs_rejects_invalid_text_verbosity(monkeypatch, verbosity):
+    _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["text"] = {"verbosity": verbosity}
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    with pytest.raises(ValueError, match="text.verbosity"):
+        _preflight_codex_api_kwargs(kwargs)
+
+
+def test_preflight_codex_api_kwargs_rejects_non_object_text(monkeypatch):
+    _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["text"] = "low"
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    with pytest.raises(ValueError, match="'text' must be an object"):
+        _preflight_codex_api_kwargs(kwargs)
+
+
 def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):
     agent = _build_agent(monkeypatch)
     responses = [_codex_tool_call_response(), _codex_message_response("done")]
