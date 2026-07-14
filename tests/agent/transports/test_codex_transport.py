@@ -54,6 +54,80 @@ class TestCodexBuildKwargs:
         assert "input" in kw
         assert kw["store"] is False
 
+    def test_profile_verbosity_is_sent_to_codex_backend(self, transport, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.get_env_value",
+            lambda name: "low" if name == "HERMES_OPENAI_VERBOSITY" else None,
+        )
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+        )
+        assert kw["text"] == {"verbosity": "low"}
+
+    @pytest.mark.parametrize("configured", ["tiny", "LOWEST", "", None])
+    def test_invalid_profile_verbosity_is_omitted(
+        self, transport, monkeypatch, configured
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.config.get_env_value",
+            lambda name: configured if name == "HERMES_OPENAI_VERBOSITY" else None,
+        )
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+        )
+        assert "text" not in kw
+
+    def test_profile_verbosity_normalizes_case_and_whitespace(
+        self, transport, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.config.get_env_value",
+            lambda name: "  LOW  " if name == "HERMES_OPENAI_VERBOSITY" else None,
+        )
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+        )
+        assert kw["text"] == {"verbosity": "low"}
+
+    @pytest.mark.parametrize("backend_flag", ["is_xai_responses", "is_github_responses"])
+    def test_profile_verbosity_is_not_sent_to_other_responses_backends(
+        self, transport, monkeypatch, backend_flag
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.config.get_env_value",
+            lambda name: "low" if name == "HERMES_OPENAI_VERBOSITY" else None,
+        )
+        kw = transport.build_kwargs(
+            model="other-model",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            **{backend_flag: True},
+        )
+        assert "text" not in kw
+
+    def test_request_override_wins_over_profile_verbosity(self, transport, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.get_env_value",
+            lambda name: "low" if name == "HERMES_OPENAI_VERBOSITY" else None,
+        )
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+            request_overrides={"text": {"verbosity": "high"}},
+        )
+        assert kw["text"] == {"verbosity": "high"}
+
     def test_system_extracted_from_messages(self, transport):
         messages = [
             {"role": "system", "content": "Custom system prompt"},

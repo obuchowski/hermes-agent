@@ -13,6 +13,26 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
 
+_OPENAI_VERBOSITY_VALUES = frozenset({"low", "medium", "high"})
+
+
+def _configured_openai_verbosity() -> Optional[str]:
+    """Return the profile-scoped OpenAI Responses verbosity preference.
+
+    The Codex transport has no user-configurable provider-profile kwargs seam,
+    so keep this opt-in and environment-backed. ``get_env_value`` preserves
+    Hermes profile/secret resolution; invalid values are ignored to retain the
+    upstream server-default behavior.
+    """
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = str(get_env_value("HERMES_OPENAI_VERBOSITY") or "").strip().lower()
+    except Exception:
+        return None
+    return value if value in _OPENAI_VERBOSITY_VALUES else None
+
+
 def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]]) -> Optional[str]:
     """Content-address the prompt cache key from the static request prefix.
 
@@ -252,6 +272,10 @@ class ResponsesApiTransport(ProviderTransport):
             ),
             "store": False,
         }
+        if is_codex_backend:
+            verbosity = _configured_openai_verbosity()
+            if verbosity:
+                kwargs["text"] = {"verbosity": verbosity}
         if response_tools:
             kwargs["tools"] = response_tools
             kwargs["tool_choice"] = "auto"
