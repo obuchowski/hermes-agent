@@ -423,6 +423,42 @@ class TestRunConversationCodexPath:
         assert routing.auto_approve_exec is True
         assert routing.auto_approve_apply_patch is True
 
+    def test_runtime_wires_executable_confirm_before_yolo_routing(
+        self, monkeypatch
+    ):
+        captured = self._capture_routing_agent(monkeypatch)
+        confirm_guard = MagicMock(return_value={"approved": False})
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "approvals": {
+                        "mode": "off",
+                        "confirm": [{"executable": "aws"}],
+                    }
+                },
+            ),
+            patch(
+                "tools.approval.check_executable_confirm_guard",
+                confirm_guard,
+            ),
+        ):
+            agent = _make_codex_agent()
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                agent.run_conversation("write something")
+
+            executable_confirm = captured["executable_confirm_callback"]
+            result = executable_confirm("aws sts get-caller-identity")
+
+        assert result == {"approved": False}
+        confirm_guard.assert_called_once_with(
+            "aws sts get-caller-identity",
+            approval_callback=captured["approval_callback"],
+        )
+
     def test_yaml_boolean_false_approval_mode_also_auto_approves(
         self, monkeypatch
     ):

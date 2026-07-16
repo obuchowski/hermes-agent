@@ -359,6 +359,14 @@ def run_codex_app_server_turn(
         except Exception:
             approval_callback = None
 
+        def _check_executable_confirm(command: str):
+            from tools.approval import check_executable_confirm_guard
+
+            return check_executable_confirm_guard(
+                command,
+                approval_callback=approval_callback,
+            )
+
         # Gateway / cron contexts have no UI to surface codex's approval
         # requests through, so codex app-server exec / apply_patch requests
         # fail closed (silently decline) by default. When the user has
@@ -399,6 +407,7 @@ def run_codex_app_server_turn(
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
+            executable_confirm_callback=_check_executable_confirm,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
                 auto_approve_apply_patch=auto_approve_requests,

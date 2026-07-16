@@ -227,6 +227,35 @@ Codex requests approval before executing commands or applying patches. These get
 - **Allow for this session** → Codex won't re-prompt for similar commands.
 - **Deny** → command is rejected; Codex continues in read-only mode.
 
+When Hermes approval bypass is active (`approvals.mode: off`, session `/yolo`,
+CLI `--yolo`, or `HERMES_YOLO_MODE`), ordinary Codex command and patch approval
+requests are accepted automatically. Configured executable-confirm rules take
+priority over that bypass:
+
+```yaml
+approvals:
+  mode: off
+  confirm:
+    - executable: aws
+```
+
+With this configuration, a Codex approval request for `echo aws` is accepted
+automatically, while a request for `aws sts get-caller-identity` requires an
+explicit **Allow once** decision. Session/permanent approval is disabled for a
+matching executable, and cron, headless, timeout, or missing-human-surface
+cases decline the request. The shared executable matcher handles command
+positions and supported literal shell wrappers; it does not match ordinary
+arguments or prose.
+
+:::warning Approval-request boundary
+This override applies when Codex emits
+`item/commandExecution/requestApproval`. Codex built-in `shell` commands that
+its own sandbox permits without an approval request are not intercepted by
+Hermes before execution. `approvals.confirm` therefore strengthens the Codex
+approval bridge but is not an absolute command-execution firewall. Codex's
+sandbox and `~/.codex/config.toml` remain the primary policy boundary.
+:::
+
 For `apply_patch` (file edit) approvals, Hermes shows a summary of what changed (`1 add, 1 update: /tmp/new.py, /tmp/old.py`) when codex provides the data via the corresponding `fileChange` item.
 
 ## Permission profiles

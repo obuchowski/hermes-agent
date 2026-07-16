@@ -2922,6 +2922,28 @@ def _run_executable_confirm_gate(
     return result
 
 
+def check_executable_confirm_guard(
+    command: str,
+    *,
+    approval_callback=None,
+) -> dict | None:
+    """Run the one-shot confirm gate when ``command`` matches a rule.
+
+    ``None`` means no configured executable matched and lets callers retain
+    their existing approval policy. A matching command always returns a full
+    approval result, including fail-closed denials, and never honors YOLO or
+    cached session/permanent approvals.
+    """
+    executable = _match_executable_confirm_rule(command)
+    if executable is None:
+        return None
+    return _run_executable_confirm_gate(
+        executable,
+        command,
+        approval_callback=approval_callback,
+    )
+
+
 def _should_skip_container_guards(env_type: str, has_host_access: bool = False) -> bool:
     """Return True when the backend is isolated enough to skip dangerous-command prompts.
 
@@ -2976,13 +2998,12 @@ def check_dangerous_command(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    confirmed_executable = _match_executable_confirm_rule(command)
-    if confirmed_executable is not None:
-        return _run_executable_confirm_gate(
-            confirmed_executable,
-            command,
-            approval_callback=approval_callback,
-        )
+    executable_confirm_result = check_executable_confirm_guard(
+        command,
+        approval_callback=approval_callback,
+    )
+    if executable_confirm_result is not None:
+        return executable_confirm_result
 
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
@@ -3295,13 +3316,12 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    confirmed_executable = _match_executable_confirm_rule(command)
-    if confirmed_executable is not None:
-        return _run_executable_confirm_gate(
-            confirmed_executable,
-            command,
-            approval_callback=approval_callback,
-        )
+    executable_confirm_result = check_executable_confirm_guard(
+        command,
+        approval_callback=approval_callback,
+    )
+    if executable_confirm_result is not None:
+        return executable_confirm_result
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.

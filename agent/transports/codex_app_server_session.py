@@ -206,6 +206,9 @@ class CodexAppServerSession:
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
+        executable_confirm_callback: Optional[
+            Callable[[str], Optional[dict]]
+        ] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
@@ -220,6 +223,7 @@ class CodexAppServerSession:
             )
         )
         self._approval_callback = approval_callback
+        self._executable_confirm_callback = executable_confirm_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
@@ -859,9 +863,19 @@ class CodexAppServerSession:
             )
 
     def _decide_exec_approval(self, params: dict) -> str:
+        command = params.get("command") or ""
+        if self._executable_confirm_callback is not None:
+            try:
+                confirm_result = self._executable_confirm_callback(command)
+            except Exception:
+                logger.exception(
+                    "executable confirm callback raised on codex exec request"
+                )
+                return "decline"
+            if confirm_result is not None:
+                return "accept" if confirm_result.get("approved") else "decline"
         if self._routing.auto_approve_exec:
             return "accept"
-        command = params.get("command") or ""
         # Codex's CommandExecutionRequestApprovalParams has cwd as Optional —
         # fall back to the session's cwd when codex doesn't include it so the
         # approval prompt is never empty (quirk #10 fix).

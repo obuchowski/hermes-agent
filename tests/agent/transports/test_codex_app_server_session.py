@@ -695,6 +695,196 @@ class TestServerRequestRouting:
         s.run_turn("hi", turn_timeout=1.0)
         assert ("r1", {"decision": "accept"}) in client.responses
 
+    @pytest.mark.parametrize(
+        ("confirm_result", "expected_decision"),
+        [
+            ({"approved": True}, "accept"),
+            ({"approved": False}, "decline"),
+        ],
+    )
+    def test_executable_confirm_overrides_auto_approve(
+        self, confirm_result, expected_decision
+    ):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="aws-1",
+            command="aws sts get-caller-identity",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        seen = []
+
+        def confirm(command):
+            seen.append(command)
+            return confirm_result
+
+        s = make_session(
+            client,
+            executable_confirm_callback=confirm,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        )
+        s.run_turn("hi", turn_timeout=1.0)
+
+        assert seen == ["aws sts get-caller-identity"]
+        assert ("aws-1", {"decision": expected_decision}) in client.responses
+
+    def test_nonmatching_executable_confirm_keeps_auto_approve(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="safe-1",
+            command="echo aws",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        seen = []
+
+        def confirm(command):
+            seen.append(command)
+            return None
+
+        s = make_session(
+            client,
+            executable_confirm_callback=confirm,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        )
+        s.run_turn("hi", turn_timeout=1.0)
+
+        assert seen == ["echo aws"]
+        assert ("safe-1", {"decision": "accept"}) in client.responses
+
+    @pytest.mark.parametrize(
+        ("command", "expected_decision"),
+        [
+            ("echo aws", "accept"),
+            ("aws sts get-caller-identity", "decline"),
+            ("/usr/local/bin/aws s3 ls", "decline"),
+        ],
+    )
+    def test_real_executable_matcher_precedes_auto_approve(
+        self, monkeypatch, command, expected_decision
+    ):
+        from tools import approval
+
+        monkeypatch.setattr(
+            approval,
+            "_get_approval_config",
+            lambda: {
+                "mode": "off",
+                "cron_mode": "approve",
+                "confirm": [{"executable": "aws"}],
+                "deny": [],
+            },
+        )
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="real-match-1",
+            command=command,
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(
+            client,
+            executable_confirm_callback=approval.check_executable_confirm_guard,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        )
+
+        s.run_turn("hi", turn_timeout=1.0)
+
+        assert (
+            "real-match-1",
+            {"decision": expected_decision},
+        ) in client.responses
+
+    def test_real_executable_matcher_requires_human_each_time(
+        self, monkeypatch
+    ):
+        from tools import approval
+
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setattr(
+            approval,
+            "_get_approval_config",
+            lambda: {
+                "mode": "off",
+                "cron_mode": "approve",
+                "confirm": [{"executable": "aws"}],
+                "deny": [],
+            },
+        )
+        approvals = []
+
+        def approve_once(command, description, **kwargs):
+            approvals.append((command, description, kwargs))
+            return "once"
+
+        def confirm(command):
+            return approval.check_executable_confirm_guard(
+                command,
+                approval_callback=approve_once,
+            )
+
+        client = FakeClient()
+        for request_id in ("aws-1", "aws-2"):
+            client.queue_server_request(
+                "item/commandExecution/requestApproval",
+                request_id=request_id,
+                command="aws sts get-caller-identity",
+                cwd="/tmp",
+            )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(
+            client,
+            executable_confirm_callback=confirm,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        )
+
+        s.run_turn("hi", turn_timeout=1.0)
+
+        assert len(approvals) == 2
+        assert all(call[2]["allow_permanent"] is False for call in approvals)
+        assert ("aws-1", {"decision": "accept"}) in client.responses
+        assert ("aws-2", {"decision": "accept"}) in client.responses
+
+    def test_executable_confirm_error_fails_closed_before_auto_approve(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="aws-1",
+            command="aws s3 ls",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        def confirm(_command):
+            raise RuntimeError("confirm unavailable")
+
+        s = make_session(
+            client,
+            executable_confirm_callback=confirm,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        )
+        s.run_turn("hi", turn_timeout=1.0)
+
+        assert ("aws-1", {"decision": "decline"}) in client.responses
+
     def test_callback_raises_falls_back_to_decline(self):
         client = FakeClient()
         client.queue_server_request("item/commandExecution/requestApproval", request_id="r1",
