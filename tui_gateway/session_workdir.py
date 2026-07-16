@@ -737,7 +737,9 @@ _WORKDIR_DB_OPEN_FAILED = object()
 def _workdir_owner_db(session: dict, fail_log: str):
     """Body of :func:`_session_db`; ``_ensure_session_db_row`` uses it directly so a patched ``_session_db`` can't alter rows."""
     db, close_db = None, False
-    if profile_home := session.get("profile_home"):
+    if (pinned := session.get("session_db")) is not None:
+        db = pinned
+    elif profile_home := session.get("profile_home"):
         try:
             from hermes_state_registry import acquire
             db, close_db = acquire(Path(profile_home) / "state.db"), True
@@ -757,8 +759,7 @@ def _workdir_owner_db(session: dict, fail_log: str):
 
 @contextlib.contextmanager
 def _session_db(session: dict):
-    """Yield the SessionDB that owns this session's row (profile-aware): a remote/profile session persists into its own
-    profile's ``state.db`` (fresh handle, closed on exit); else the shared ``_get_db()`` handle (left open). None if unavailable."""
+    """Yield the DB owning this row: pinned canonical owner first, then profile-local, then launch DB."""
     with _workdir_owner_db(session, "failed to open profile db for session") as db:
         yield None if db is _WORKDIR_DB_OPEN_FAILED else db
 

@@ -556,18 +556,37 @@ def _(rid, params: dict, db) -> dict:
         # Over-fetch: per-source filtering + tip merging must not leave us short. ``include_hidden`` is for
         # surfaces that OWN hidden sessions (Bots pane, pickers).
         from pathlib import Path
-
         from hermes_cli.session_listing import show_subagent_sessions
-
-        # ``sessions.show_subagents`` (the store's own profile config) re-admits delegate runs (#97202).
-        # A store without a path has no profile config to read, so it keeps the default shape.
-        db_path = getattr(db, "db_path", None)
-        include_subagents = bool(db_path) and show_subagent_sessions(Path(db_path).parent)
-        rows = _listing_rows(db, max(limit * 2, 200), include_hidden=_flag(params, "include_hidden"),
-                             include_subagents=include_subagents)[:limit]
         # No live_message_count here on purpose: the bulk listing serves rows whose open
         # paths never demand history (expectHistory defaults false); the count is a
         # per-session scan and would turn one listing call into hundreds of them.
+        from hermes_cli.profiles import get_active_profile_name
+        from hermes_cli.session_resolution import merge_profile_session_rows
+        active_profile = _str_param(params, "profile") or get_active_profile_name() or "default"
+        fetch_limit = max(limit * 2, 200)
+        if active_profile == "default":
+            rows = merge_profile_session_rows(
+                active_profile=active_profile,
+                local_db=db,
+                root_db=db,
+                load_rows=lambda owner: _listing_rows(
+                    owner, fetch_limit, include_hidden=_flag(params, "include_hidden"),
+                    include_subagents=bool(getattr(owner, "db_path", None)) and
+                    show_subagent_sessions(Path(owner.db_path).parent)),
+            )[:limit]
+        else:
+            with _profile_db({"profile": active_profile}) as profile_db:
+                if profile_db is None:
+                    return _db_unavailable_error(rid, code=5006)
+                rows = merge_profile_session_rows(
+                    active_profile=active_profile,
+                    local_db=profile_db,
+                    root_db=db,
+                    load_rows=lambda owner: _listing_rows(
+                        owner, fetch_limit, include_hidden=_flag(params, "include_hidden"),
+                        include_subagents=bool(getattr(owner, "db_path", None)) and
+                        show_subagent_sessions(Path(owner.db_path).parent)),
+                )[:limit]
         return _ok(rid, {"sessions": [_session_row_summary(s) for s in rows]})
     except Exception as e:
         return _err(rid, 5006, str(e))
@@ -630,6 +649,8 @@ class _Resume:
         # ``profile`` (app-global remote mode): resume from another local profile's state.db.
         self.profile = (params.get("profile") or "").strip() or None
         self.profile_home = _profile_home(self.profile)
+        from hermes_cli.profiles import get_active_profile_name
+        self.active_profile = self.profile or get_active_profile_name() or "default"
         self.lazy, self.defer_history = _flag(params, "lazy"), _flag(params, "defer_history")
         # Desktop hydrates over REST; suppress the duplicate WS copy only when asked.
         self.omit_messages, self.eager_build = _flag(params, "omit_messages"), _flag(params, "eager_build")
@@ -655,7 +676,9 @@ class _Resume:
         record = _deferred_session_record(
             self.target, cols=self.cols, cwd=cwd, history=history, lease=None, source=source,
             close_on_disconnect=_flag(self.params, "close_on_disconnect"),
-            profile_home=self.profile_home, explicit_cwd=bool(self.profile_resume_cwd), **extra)
+            profile_home=self.profile_home, profile_name=self.active_profile,
+            explicit_cwd=bool(self.profile_resume_cwd), session_db=self.db,
+            session_db_owned=self.owns_db, session_db_pinned=self.owns_db, **extra)
         if follows_profile:
             record.update(
                 follow_profile_config=True,
@@ -667,6 +690,9 @@ class _Resume:
     def claim(self, sid: str, record: dict) -> dict | None:
         """Register ``record`` live under the resume lock, or reuse a concurrent winner's session."""
         live = _claim_or_reuse_live(sid, self.target, record, None)
+        if record.get("session_db") is self.db or "session_db" not in record:
+            # Registered record now owns the handle, or the race-discard path closed it.
+            self.owns_db = False
         return None if live is None else _resume_reuse_live(self, *live)
 
     def restore(self):
@@ -964,9 +990,8 @@ def _resume_deferred(ctx: _Resume) -> dict:
         return reused
     # Desktop owns the visible transcript through bounded REST pages, not this model-history restore.
     _schedule_resume_hydration(
-        sid, ctx.target, ctx.db, close_db=ctx.owns_db,
+        sid, ctx.target, ctx.db, close_db=False,
         model_history_only=source == "desktop" and ctx.omit_messages)
-    ctx.owns_db = False  # the hydration worker now owns (and closes) the profile-scoped handle
     _schedule_session_cap_enforcement()
     return _resume_response(ctx, sid, record, info=ctx.info(cwd, overrides), messages=[],
                             message_count=record["resume_message_count"], status="resuming", hydrating=True)
@@ -1040,7 +1065,14 @@ def _resume_eager(ctx: _Resume) -> dict:
                 # Each turn re-binds HERMES_HOME (mid-turn memory/skills reads); lease claimed lazily on turn 1.
                 if ctx.profile_home is not None:
                     session["profile_home"] = str(ctx.profile_home)
-                session.update(display_history_prefix=display_history_prefix, active_session_lease=None)
+                session.update(
+                    display_history_prefix=display_history_prefix,
+                    active_session_lease=None,
+                    profile_name=ctx.active_profile,
+                    session_db=ctx.db,
+                    session_db_owned=False,
+                    session_db_pinned=True,
+                )
         except Exception as e:
             # _init_session registers _sessions[sid] BEFORE its first db read; left in place the fast path
             # would serve that dead session forever.
@@ -1065,6 +1097,18 @@ def _(rid, params: dict) -> dict:
     try:
         if ctx.db is None:
             return _db_unavailable_error(rid, code=5000)
+        from hermes_cli.session_resolution import resolve_active_profile_session
+        initial_db, initial_owned = ctx.db, ctx.owns_db
+        resolved = resolve_active_profile_session(
+            ctx.target, active_profile=ctx.active_profile, current_db=ctx.db)
+        if resolved is not None:
+            ctx.target = resolved.session_id
+            ctx.db, ctx.owns_db = resolved.db, resolved.owns_db
+            if initial_db is not ctx.db and initial_owned:
+                _release_db(initial_db)
+            if ctx.profile_home is None and ctx.active_profile != "default":
+                from hermes_cli.profiles import get_profile_dir
+                ctx.profile_home = get_profile_dir(ctx.active_profile)
         if (resp := _resume_locate(ctx)) is not None:
             return resp
         _resume_follow_tip(ctx)
@@ -1414,7 +1458,20 @@ def _(rid, params: dict, session: dict) -> dict:
         try:
             if not db.get_session(key):
                 db.set_session_title(key, f"handoff-{key[:8]}")
-            if not db.request_handoff(key, platform_name):
+            profile_name = str(session.get("profile_name") or _current_profile_name() or "default")
+            try:
+                queued = db.request_handoff(
+                    key,
+                    platform_name,
+                    profile_name=profile_name if profile_name != "default" else None,
+                )
+            except TypeError as exc:
+                # Compatibility for custom/test SessionDB stand-ins that still implement
+                # the pre-profile-aware two-argument contract.
+                if "profile_name" not in str(exc):
+                    raise
+                queued = db.request_handoff(key, platform_name)
+            if not queued:
                 return _err(rid, 4027, "session is already in flight for handoff — wait for it to settle, then retry")
         except Exception as e:
             return _err(rid, 5007, str(e))
@@ -1424,9 +1481,30 @@ def _(rid, params: dict, session: dict) -> dict:
 @method("handoff.state")
 @_with_db(5007, session_scoped=True)
 def _(rid, params: dict, session: dict, db) -> dict:
-    """Poll ``{state, platform, error}``; ``state`` is pending|running|completed|failed or empty."""
+    """Poll handoff state, treating a canonical root copy as an ownership commit."""
     record = db.get_handoff_state(session["session_key"]) or {}
-    return _ok(rid, {field: record.get(field) or "" for field in ("state", "platform", "error")})
+    state = record.get("state") or ""
+    if state == "transferred_with_warning":
+        state = "completed"
+    elif state in {"", "pending", "running"}:
+        profile_name = str(session.get("profile_name") or _current_profile_name() or "default")
+        if profile_name != "default":
+            try:
+                from hermes_cli.session_resolution import canonical_root_owns_session
+                if canonical_root_owns_session(
+                    session["session_key"], active_profile=profile_name):
+                    state = "completed"
+                    record["error"] = (
+                        "Local handoff status is stale; the canonical root owns this session. "
+                        f"Resume canonical session {session['session_key']}."
+                    )
+            except Exception:
+                logger.debug("canonical handoff ownership check failed", exc_info=True)
+    return _ok(rid, {
+        "state": state,
+        "platform": record.get("platform") or "",
+        "error": record.get("error") or "",
+    })
 
 
 @method("handoff.fail")

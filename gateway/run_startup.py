@@ -1682,6 +1682,31 @@ class GatewayStartupMixin:
         logger.info("Press Ctrl+C to stop")
         return True
 
+    def _handoff_sources(self) -> list[tuple[str, Any, str]]:
+        """Return root plus profile-local handoff databases served by this gateway."""
+        if getattr(self, "_session_db", None) is None:
+            return []
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return [("default", self._session_db, "gateway_root")]
+        from pathlib import Path
+        from hermes_cli.profiles import get_active_profile_name, profiles_to_serve
+        from hermes_state import AsyncSessionDB, SessionDB
+
+        active = get_active_profile_name() or "default"
+        sources = [(active, self._session_db, "gateway_root")]
+        handles = getattr(self, "_handoff_profile_dbs", None)
+        if handles is None:
+            handles = self._handoff_profile_dbs = {}
+        for profile_name, profile_home in profiles_to_serve(multiplex=True):
+            if profile_name == active:
+                continue
+            if profile_name not in handles:
+                handles[profile_name] = AsyncSessionDB(
+                    SessionDB(db_path=Path(profile_home) / "state.db")
+                )
+            sources.append((profile_name, handles[profile_name], "profile"))
+        return sources
+
     @dataclasses.dataclass
     class _HandoffDestination:
         """Resolved destination for one handoff row."""
@@ -1698,12 +1723,14 @@ class GatewayStartupMixin:
         """Return (config, adapters) for the profile that queued the handoff. For a secondary
         profile the watcher already entered _profile_runtime_scope, so a fresh load resolves THAT
         profile's config; fail closed — self.config would deliver to the WRONG chat."""
-        from gateway.run import load_gateway_config
+        from gateway.config import load_gateway_config
         if not profile_name or profile_name == "default":
             return self.config, self.adapters
         secondary = (self._profile_adapters or {}).get(profile_name)
         if not secondary:
-            raise RuntimeError(f"profile '{profile_name}' has no live adapters in this gateway")
+            raise RuntimeError(
+                f"profile '{profile_name}' platform is not active in this gateway"
+            )
         try:
             return load_gateway_config(), secondary
         except Exception as exc:
@@ -1826,13 +1853,55 @@ class GatewayStartupMixin:
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False), profile=handoff_profile,
         )
 
-    async def _process_handoff(self, row: Dict[str, Any], profile_name: Optional[str] = None) -> None:
-        """Execute one handoff row; raises on failure (caller marks failed). ``profile_name`` (None =
-        root) is the profile whose store queued it — load-bearing under multiplex: secondaries live in
-        ``_profile_adapters`` and the key must be namespaced ``agent:<profile>:...`` or nobody reads it."""
+    async def _process_handoff(
+        self,
+        row: Dict[str, Any],
+        profile_name: Optional[str] = None,
+        *,
+        source_profile: Optional[str] = None,
+        source_db: Any = None,
+    ) -> None:
+        """Execute one handoff, transferring named-profile lineage to the root first."""
+        from gateway.run import HandoffPostCommitError
+
         cli_session_id = row["id"]
-        dest = await self._handoff_resolve_destination(row, profile_name)
-        session_key = self._handoff_session_key(dest, profile_name)
+        source_profile = str(
+            source_profile or profile_name or row.get("profile_name") or "default"
+        ).strip() or "default"
+        row_profile = str(row.get("profile_name") or "").strip()
+        if row_profile and row_profile != source_profile:
+            raise RuntimeError(
+                f"session belongs to profile {row_profile!r}, not {source_profile!r}"
+            )
+        dest = await self._handoff_resolve_destination(row, source_profile)
+
+        source_db = source_db or self._session_db
+        source_sync = getattr(source_db, "_db", source_db)
+        root_db = self._session_db
+        root_sync = getattr(root_db, "_db", root_db)
+        lineage_committed = False
+        source_status_error = None
+        if source_sync is not root_sync:
+            transfer_result = await root_db.transfer_session_lineage_from(
+                source_sync, cli_session_id, profile_name=source_profile
+            )
+            if not transfer_result.get("ok"):
+                raise RuntimeError(
+                    f"could not transfer session lineage: {transfer_result.get('errors') or transfer_result}"
+                )
+            lineage_committed = True
+        try:
+            await source_db.mark_handoff_transferred(cli_session_id)
+        except Exception as exc:
+            if not lineage_committed:
+                raise
+            source_status_error = exc
+            logger.warning(
+                "Handoff source status write failed after canonical transfer for %s: %s",
+                cli_session_id, exc,
+            )
+
+        session_key = self._handoff_session_key(dest, source_profile)
         # Ensure a session_store entry exists for this key; switch_session then re-points it.
         await self.async_session_store.get_or_create_session(dest.source)
         # switch_session ends the prior session and reopens the CLI session under the new key.
@@ -1865,6 +1934,11 @@ class GatewayStartupMixin:
         response_text = await self._handle_message(synthetic_event)
         if not response_text:
             # Streaming may have delivered inline; the agent ran without raising — success.
+            if source_status_error is not None:
+                raise HandoffPostCommitError(
+                    "delivery completed after canonical transfer, but source status could not "
+                    f"be updated: {source_status_error}"
+                ) from source_status_error
             return
         # Reply into the new thread (else the home channel) via the resolved transport, so a relay-fronted
         # logical platform is stamped on the outbound frame.
@@ -1876,4 +1950,9 @@ class GatewayStartupMixin:
         except Exception as exc:
             raise RuntimeError(f"adapter.send failed: {exc}") from exc
         if not getattr(result, "success", True):
-            raise RuntimeError(f"adapter.send failed: {_send_error(result)}")
+            raise HandoffPostCommitError(f"adapter.send failed: {_send_error(result)}")
+        if source_status_error is not None:
+            raise HandoffPostCommitError(
+                "delivery completed after canonical transfer, but source status could not "
+                f"be updated: {source_status_error}"
+            ) from source_status_error

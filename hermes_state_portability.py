@@ -729,6 +729,150 @@ class SessionPortabilityMixin:
                 detached += 1
         return detached
 
+    def transfer_session_lineage_from(
+        self, source_db: Any, session_id: str, *, profile_name: str
+    ) -> Dict[str, Any]:
+        """Atomically copy a trusted profile-owned compression lineage into this DB."""
+        profile_name = str(profile_name or "").strip()
+        if not profile_name:
+            raise ValueError("profile_name is required")
+        exported = source_db.export_session_lineage(session_id)
+        if not exported or not (segments := exported.get("segments")):
+            raise ValueError(f"session not found: {session_id}")
+
+        payload = []
+        for original in segments:
+            segment = dict(original)
+            segment_id = str(segment.get("id") or "").strip()
+            owner = str(segment.get("profile_name") or "").strip()
+            if owner and owner != profile_name:
+                raise ValueError(
+                    f"session {segment_id} belongs to profile {owner!r}, not {profile_name!r}"
+                )
+            segment["messages"] = source_db.get_messages(
+                segment_id, include_inactive=True
+            )
+            payload.append(segment)
+
+        normalized, errors = self._validate_import_payload(payload)
+        if errors:
+            return {"ok": False, "imported": 0, "skipped": 0, "detached": 0, "errors": errors}
+
+        def _semantic(value):
+            if isinstance(value, str):
+                try:
+                    return json.loads(value)
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            return value
+
+        def _strict_equal(left, right):
+            if type(left) is not type(right):
+                return False
+            if isinstance(left, dict):
+                return left.keys() == right.keys() and all(
+                    _strict_equal(left[key], right[key]) for key in left
+                )
+            if isinstance(left, list):
+                return len(left) == len(right) and all(
+                    _strict_equal(a, b) for a, b in zip(left, right)
+                )
+            return left == right
+
+        session_fields = (
+            "source", "user_id", "model", "model_config", "parent_session_id",
+            "started_at", "ended_at", "end_reason", "input_tokens", "output_tokens",
+            "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "cwd",
+            "git_branch", "git_repo_root", "billing_provider", "billing_base_url",
+            "billing_mode", "estimated_cost_usd", "actual_cost_usd", "cost_status",
+            "cost_source", "pricing_version", "title", "api_call_count", "archived",
+        )
+        message_fields = (
+            "role", "content", "tool_call_id", "tool_calls", "tool_name",
+            "effect_disposition", "timestamp", "token_count", "finish_reason",
+            "reasoning", "reasoning_content", "reasoning_details",
+            "codex_reasoning_items", "codex_message_items", "platform_message_id",
+            "observed", "active", "compacted",
+        )
+        json_fields = {"model_config", "tool_calls", "reasoning_details", "codex_reasoning_items", "codex_message_items"}
+
+        def _equivalent(conn, raw, messages):
+            existing = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (raw["id"],)
+            ).fetchone()
+            if existing is None or str(existing["profile_name"] or "").strip() != profile_name:
+                return False
+            actual = dict(existing)
+            for field in session_fields:
+                left, right = actual.get(field), raw.get(field)
+                if field in json_fields:
+                    if not _strict_equal(_semantic(left), _semantic(right)):
+                        return False
+                elif left != right and not (
+                    field in {"input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "api_call_count", "archived"}
+                    and int(left or 0) == int(right or 0)
+                ):
+                    return False
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY id", (raw["id"],)
+            ).fetchall()
+            if len(rows) != len(messages):
+                return False
+            for row, expected in zip(rows, messages):
+                actual_msg = dict(row)
+                actual_msg["content"] = self._decode_content(actual_msg.get("content"))
+                for field in message_fields:
+                    left, right = actual_msg.get(field), expected.get(field)
+                    if field == "platform_message_id":
+                        right = right or expected.get("message_id")
+                    if field in {"observed", "active", "compacted"}:
+                        left, right = int(left or 0), int(right if right is not None else (1 if field == "active" else 0))
+                    if field in json_fields:
+                        if not _strict_equal(_semantic(left), _semantic(right or None)):
+                            return False
+                    elif left != right:
+                        return False
+            return True
+
+        def _do(conn):
+            imported, skipped, parents = [], [], []
+            # Validate every collision before writing anything.
+            for item in normalized:
+                raw, messages = item["session"], item["messages"]
+                existing = conn.execute("SELECT profile_name FROM sessions WHERE id = ?", (raw["id"],)).fetchone()
+                if existing is None:
+                    continue
+                existing_owner = str(existing["profile_name"] or "").strip()
+                if existing_owner != profile_name:
+                    raise ValueError(
+                        f"session {raw['id']} already belongs to profile {existing_owner or 'default'!r}"
+                    )
+                if not _equivalent(conn, raw, messages):
+                    raise ValueError(
+                        f"session {raw['id']} trusted transfer payload diverges from the existing destination state"
+                    )
+            for item in normalized:
+                raw, messages = item["session"], item["messages"]
+                sid = raw["id"]
+                if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone():
+                    skipped.append(sid)
+                    continue
+                self._import_session_row(conn, raw, messages, sid)
+                conn.execute("UPDATE sessions SET profile_name = ? WHERE id = ?", (profile_name, sid))
+                rows = conn.execute("SELECT id FROM messages WHERE session_id = ? ORDER BY id", (sid,)).fetchall()
+                for row, message in zip(rows, messages):
+                    conn.execute(
+                        "UPDATE messages SET active = ?, compacted = ? WHERE id = ?",
+                        (1 if message.get("active", 1) else 0, 1 if message.get("compacted", 0) else 0, row[0]),
+                    )
+                if raw.get("parent_session_id"):
+                    parents.append((sid, str(raw["parent_session_id"])))
+                imported.append(sid)
+            self._attach_import_parents(conn, parents)
+            return {"ok": True, "session_id": session_id, "transferred_ids": imported, "already_present_ids": skipped}
+
+        return self._execute_write(_do)
+
     def import_sessions(self, sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Import sessions exported by :meth:`export_session` or ``export_all``. Existing ids
         are skipped. A child keeps its parent only when the parent exists or is in the

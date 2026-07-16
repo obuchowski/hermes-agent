@@ -881,14 +881,39 @@ class SessionGatewayMixin:
             " ORDER BY last_heartbeat DESC")
         return [dict(r) for r in rows]
 
-    def request_handoff(self, session_id: str, platform: str) -> bool:
-        """Mark a session pending handoff to *platform*; False if a handoff is already in flight."""
-        return self._write_rowcount(
-            "UPDATE sessions SET handoff_state = 'pending',     handoff_platform = ?, "
-            "    handoff_error = NULL WHERE id = ? AND (handoff_state IS NULL "
-            "                  OR handoff_state IN ('completed', 'failed'))",
-            (platform, session_id),
-        ) > 0
+    def request_handoff(
+        self,
+        session_id: str,
+        platform: str,
+        *,
+        profile_name: Optional[str] = None,
+    ) -> bool:
+        """Mark a session pending, optionally stamping its trusted profile owner."""
+        trusted_profile = str(profile_name or "").strip() or None
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT profile_name FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            existing_profile = str(row["profile_name"] or "").strip()
+            if trusted_profile and existing_profile and existing_profile != trusted_profile:
+                raise ValueError(
+                    f"session {session_id} belongs to profile {existing_profile!r}, "
+                    f"not {trusted_profile!r}"
+                )
+            cur = conn.execute(
+                "UPDATE sessions SET handoff_state = 'pending', handoff_platform = ?, "
+                "handoff_error = NULL, profile_name = CASE "
+                "WHEN profile_name IS NULL OR TRIM(profile_name) = '' THEN ? "
+                "ELSE profile_name END WHERE id = ? AND (handoff_state IS NULL "
+                "OR handoff_state IN ('completed', 'failed'))",
+                (platform, trusted_profile, session_id),
+            )
+            return cur.rowcount > 0
+
+        return self._execute_write(_do)
 
     def get_handoff_state(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Return ``{"state", "platform", "error"}`` or None if the session has no handoff record."""
@@ -932,18 +957,32 @@ class SessionGatewayMixin:
             "UPDATE sessions SET handoff_state = 'completed', handoff_error = NULL WHERE id = ?",
             (session_id,))
 
+    def mark_handoff_transferred(self, session_id: str) -> None:
+        """Record the irreversible ownership commit before delivery."""
+        self._write_sql(
+            "UPDATE sessions SET handoff_state = 'transferred', handoff_error = NULL "
+            "WHERE id = ? AND handoff_state = 'running'",
+            (session_id,),
+        )
+
+    def complete_handoff_with_warning(self, session_id: str, error: str) -> None:
+        """Finish a committed handoff without reactivating its local copy."""
+        self._write_sql(
+            "UPDATE sessions SET handoff_state = 'transferred_with_warning', handoff_error = ? "
+            "WHERE id = ? AND handoff_state IN ('running', 'transferred')",
+            (error[:500], session_id),
+        )
+
     def fail_handoff(
         self, session_id: str, error: str, *, only_states: Optional[Tuple[str, ...]] = None) -> bool:
-        """Mark a handoff failed and record the reason; True when a row transitioned. ``only_states`` makes
-        the write a compare-and-swap on ``handoff_state``. Waiters that give up (CLI 60s poll, Desktop
-        bounded poll) MUST pass ``only_states=("pending",)``: once the watcher has claimed the row
-        (``running``) it owns the terminal state, and an unconditional waiter-side fail races the dispatch —
-        the gateway later overwrites ``failed`` → ``completed`` after the user was told the gateway is down
-        (split-brain: the handoff delivered and ``switch_session`` re-pointed the session). The watcher
-        fails its OWN claimed row unconditionally."""
-        states = tuple(only_states) if only_states else ()
+        """Fail only a pre-commit handoff; transferred ownership is irreversible."""
+        requested = tuple(only_states) if only_states else ("pending", "running")
+        states = tuple(state for state in requested if state in {"pending", "running"})
+        if not states:
+            return False
         sql = _HANDOFF_FAIL_SQL + "id = ?" + (
-            f" AND handoff_state IN ({', '.join('?' for _ in states)})" if states else "")
+            f" AND handoff_state IN ({', '.join('?' for _ in states)})"
+        )
         return self._write_rowcount(sql, (error[:500], session_id, *states)) > 0
 
     def reclaim_stale_running_handoffs(self, error: str) -> List[str]:

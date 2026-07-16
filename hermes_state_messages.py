@@ -719,6 +719,7 @@ class SessionMessagesMixin:
         row = self._read_one("SELECT role FROM messages WHERE id = ? AND session_id = ? AND active = 1", (int(row_id), session_id))
         return row[0] if row else None
 
+
     def _carry_parent_timestamps(self, conn, parent_session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Adopt the durable parent row's timestamp onto carried handoff rows so the re-inserted child row keeps
         the original's display identity (see _display_dedupe_key). Idempotent; never overwrites a timestamp the
@@ -753,11 +754,12 @@ class SessionMessagesMixin:
             return  # Best-effort: a failed carry falls back to the publish-time stamp, never breaks publish.
 
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]], *,
-                             prune_checkpoints: bool = True) -> tuple[int, int]:
+                             prune_checkpoints: bool = True, preserve_state: bool = False) -> tuple[int, int]:
         """Insert *messages* as fresh active rows in the caller's txn -> ``(inserted, tool_call_count)``.
         Never touches sessions.* counters (callers reconcile differently); reasoning kept for assistant rows.
         A caller that re-archives some rows afterwards passes ``prune_checkpoints=False`` and prunes once they
         are archived again (:meth:`_prune_shadowed_checkpoints`)."""
+
         now_ts = time.time()
         inserted = tool_calls_total = 0
         batch_tool_index: Dict[str, str] = {}
@@ -779,6 +781,15 @@ class SessionMessagesMixin:
             msg["timestamp"] = message_timestamp
             if cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
+                if preserve_state:
+                    conn.execute(
+                        "UPDATE messages SET active = ?, compacted = ? WHERE id = ?",
+                        (
+                            1 if msg.get("active", 1) else 0,
+                            1 if msg.get("compacted", 0) else 0,
+                            cur.lastrowid,
+                        ),
+                    )
             inserted += 1
             tool_calls_total += _tool_calls_count(tool_calls)
             now_ts = max(now_ts, message_timestamp) + 1e-6

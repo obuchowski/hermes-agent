@@ -13,6 +13,7 @@ flip pending → running, and finishes with ``complete_handoff`` or
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from contextlib import contextmanager
 
 import pytest
@@ -38,6 +39,28 @@ class TestHandoffStateDB:
                 (session_id, source, title, time.time()),
             )
         db._execute_write(_do)
+
+
+    def test_request_handoff_stamps_trusted_profile_without_rewriting_owner(self, db):
+        sid = "sess-profile"
+        self._make_session(db, sid)
+        db._conn.execute(
+            "UPDATE sessions SET profile_name = '' WHERE id = ?", (sid,)
+        )
+        db._conn.commit()
+
+        assert db.request_handoff(sid, "discord", profile_name="programmer") is True
+        assert db.get_session(sid)["profile_name"] == "programmer"
+
+        db.fail_handoff(sid, "retry")
+        with pytest.raises(ValueError, match="belongs to profile 'programmer'"):
+            db.request_handoff(sid, "discord", profile_name="ula")
+
+        assert db.get_session(sid)["profile_name"] == "programmer"
+
+
+
+
 
     def test_list_pending_handoffs_excludes_running_and_terminal(self, db):
         a, b, c, d = "sess-a", "sess-b", "sess-c", "sess-d"
@@ -70,6 +93,28 @@ class TestHandoffStateDB:
         state = db.get_handoff_state(sid)
         assert state["state"] == "completed"
         assert state["error"] is None
+
+
+    def test_post_transfer_failure_never_reactivates_local_copy(self, db):
+        sid = "sess-transferred-warning"
+        self._make_session(db, sid)
+        db.request_handoff(sid, "discord", profile_name="programmer")
+        db.claim_handoff(sid)
+        db.mark_handoff_transferred(sid)
+
+        db.fail_handoff(sid, "late failure must not roll ownership back")
+        assert db.get_handoff_state(sid)["state"] == "transferred"
+
+        db.complete_handoff_with_warning(sid, "delivery exhausted retries")
+        assert db.get_handoff_state(sid) == {
+            "state": "transferred_with_warning",
+            "platform": "discord",
+            "error": "delivery exhausted retries",
+        }
+        assert db.request_handoff(sid, "discord", profile_name="programmer") is False
+
+
+
 
     def test_full_pending_to_completed_flow(self, db):
         """End-to-end sequence the CLI + gateway watcher follow."""
@@ -118,3 +163,51 @@ class TestHandoffStateDB:
         assert db.get_handoff_state(sid)["state"] == "pending"
         assert [row["id"] for row in db.list_pending_handoffs()] == [sid]
         assert len(entered) == 2
+
+
+def test_named_profile_cli_command_queues_in_owning_db(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+    from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+    sid = "named-cli-handoff"
+    db = SessionDB(db_path=tmp_path / "profiles" / "programmer" / "state.db")
+    db.create_session(sid, "cli")
+    config = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(
+                enabled=True,
+                token="test",
+                home_channel=HomeChannel(
+                    platform=Platform.DISCORD,
+                    chat_id="programmer-home",
+                    name="Programmer Home",
+                ),
+            )
+        }
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "programmer"
+    )
+    monkeypatch.setattr(
+        db,
+        "get_handoff_state",
+        lambda _sid: {"state": "completed", "platform": "discord", "error": None},
+    )
+    class FakeCLI(CLICommandsMixin):
+        pass
+
+    cli = FakeCLI()
+    cli.session_id = sid
+    cli._session_db = db
+    cli._agent_running = False
+    cli._should_exit = False
+
+    try:
+        keep_running = CLICommandsMixin._handle_handoff_command(cli, "/handoff discord")
+
+        assert keep_running is False
+        assert cli._should_exit is True
+        assert db.get_session(sid)["profile_name"] == "programmer"
+    finally:
+        db.close()

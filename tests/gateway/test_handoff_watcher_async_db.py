@@ -61,6 +61,10 @@ class _RecordingSessionDB:
     def fail_handoff(self, session_id, error):
         self._record("fail_handoff")
 
+    def complete_handoff_with_warning(self, session_id, error):
+        self._record("complete_handoff_with_warning")
+        raise OSError("persistent source write failure")
+
 
 def _make_fake_runner(session_db, *, fail_process=False):
     """Build a minimal object that exposes exactly what the loop body touches.
@@ -85,7 +89,7 @@ def _make_fake_runner(session_db, *, fail_process=False):
 
     fake._running = _Running()
 
-    async def _process_handoff(row):
+    async def _process_handoff(row, **_kwargs):
         if fail_process:
             raise RuntimeError("boom")
 
@@ -103,6 +107,23 @@ async def _run_one_tick(fake, monkeypatch):
     # Bind the real (patched) method onto our minimal stand-in.
     coro = run.GatewayRunner._handoff_watcher(fake, interval=0.0)
     await asyncio.wait_for(coro, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_postcommit_warning_write_failure_never_calls_precommit_fail(monkeypatch):
+    import threading
+
+    db = _RecordingSessionDB(threading.get_ident())
+    fake = _make_fake_runner(db)
+
+    async def _postcommit_failure(row, **_kwargs):
+        raise run.HandoffPostCommitError("delivery failed after canonical transfer")
+
+    fake._process_handoff = _postcommit_failure
+    await _run_one_tick(fake, monkeypatch)
+
+    assert "complete_handoff_with_warning" in db.calls
+    assert "fail_handoff" not in db.calls
 
 
 @pytest.mark.asyncio

@@ -1633,6 +1633,10 @@ class MultiplexConfigError(RuntimeError):
     startup guard instead of being treated as retryable adapter-connect noise."""
 
 
+class HandoffPostCommitError(RuntimeError):
+    """A handoff transferred storage ownership but did not finish delivery."""
+
+
 class HygieneTurnHoldExceeded(Exception):
     """Hygiene-compression turn-hold budget elapsed mid-stream. Availability boundary, not a failure:
     must NOT take the idle-timeout path (AGENT_COMPRESSION_TIMEOUT, "no output", failure cooldown)."""
@@ -3475,6 +3479,8 @@ class GatewayRunner(
         # Each SERVED profile's gateway config, as loaded once by ``_load_secondary_profile_config``.
         # ``self.config`` is only the launch profile's: anything host-wide (restart notices) needs these.
         self._profile_configs: Dict[str, Any] = {}
+
+        self._handoff_profile_dbs: Dict[str, Any] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 

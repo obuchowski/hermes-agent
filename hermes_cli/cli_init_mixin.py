@@ -294,7 +294,7 @@ class CLIInitMixin:
 
         self._fallback_model = get_fallback_chain(CLI_CONFIG)
 
-    def _init_runtime_state(self, resume):
+    def _init_runtime_state(self, resume, *, session_db=None):
         """Session store + all per-run mutable state (queues, overlays, pet/voice/status-bar fields)."""
         from cli import _hermes_home
         # A signature change across turns (/model, credential rotation) rebuilds the agent.
@@ -309,7 +309,7 @@ class CLIInitMixin:
         self._prompt_start_time: Optional[float] = None
         self._prompt_duration: float = 0.0
         self._last_turn_finished_at: Optional[float] = None
-        self._init_session_store()
+        self._init_session_store(session_db=session_db)
         self._pending_title: Optional[str] = None
         self._resumed = bool(resume)
         self.session_id = resume or new_session_id(self.session_start)
@@ -319,10 +319,11 @@ class CLIInitMixin:
         self._last_invalidate: float | None = None  # throttles UI repaints (None = never; monotonic epoch is arbitrary)
         self._init_ui_state()
 
-    def _init_session_store(self):
+    def _init_session_store(self, *, session_db=None):
         """Open the session store early (so /title works before the first message) + opportunistic maintenance."""
         from cli import _run_checkpoint_auto_maintenance, _run_state_db_auto_maintenance
-        self._session_db = None
+        self._session_db = session_db
+        self._session_db_owned = session_db is None
         self._session_db_unavailable = False
         try:
             # Registry handle, not a bare SessionDB(): goals/loops/heartbeat acquire the same
@@ -330,7 +331,8 @@ class CLIInitMixin:
             # open (the /proc-wide deleted-WAL scan, ~4k readlinks) while the render thread
             # holds the GIL — that repeat was the post-banner freeze before the first prompt.
             from hermes_state_registry import acquire
-            self._session_db = acquire()
+            if self._session_db is None:
+                self._session_db = acquire()
         except Exception as e:
             # Without a store the transcript is NOT persisted while the chat looks healthy,
             # so surface it prominently rather than only logging.

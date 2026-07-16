@@ -482,6 +482,16 @@ def _transfer_db_to_agent(agent, db) -> bool:
     return False
 
 
+def _close_owned_session_db(session: dict | None) -> None:
+    """Close and detach a session-pinned database only while the record owns it."""
+    if not session or not session.pop("session_db_owned", False):
+        return
+    db = session.pop("session_db", None)
+    if db is not None:
+        with contextlib.suppress(Exception):
+            db.close()
+
+
 def _open_profile_session_db(profile_home):
     """Open a DEDICATED handle on ``profile_home``'s ``state.db`` — FAIL CLOSED: a silent fallback to the
     launch ``state.db`` would bleed rows into the wrong profile's store exactly when the profile store is
@@ -1133,9 +1143,18 @@ def _finish_agent_build(sid: str, key: str, current: dict, *, notify_registered:
             unregister_gateway_notify(key)
     # Dedicated profile handle: hand it to the agent that will be torn down, else close it (build
     # failed, or `replaced`: this agent is discarded and _teardown_session never reaches it).
-    if session_db is not None and not _transfer_db_to_agent(None if replaced else current.get("agent"), session_db):
-        with contextlib.suppress(Exception):
-            session_db.close()
+    if session_db is not None:
+        pinned_owner = bool(current.get("session_db_pinned") and current.get("session_db_owned"))
+        transferred = False if pinned_owner else _transfer_db_to_agent(
+            None if replaced else current.get("agent"), session_db)
+        if transferred:
+            # Keep the pointer for profile-aware reads; AIAgent now owns lifetime.
+            current["session_db_owned"] = False
+        elif replaced or current.get("agent") is None:
+            _close_owned_session_db(current)
+            if not pinned_owner and current.get("session_db") is not session_db:
+                with contextlib.suppress(Exception):
+                    session_db.close()
 
 
 def _start_agent_build(sid: str, session: dict) -> None:
@@ -1166,7 +1185,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
             session["agent_error"] = AGENT_BUILD_ABANDONED
             ready.set()
             return
-        notify_registered, scopes, session_db = False, None, None
+        notify_registered, scopes = False, None
+        session_db = current.get("session_db")
         profile_home = current.get("profile_home")
         try:
             if not _await_resume_history(sid, current):
@@ -1180,7 +1200,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # binding the launch DB and bleeding rows into the wrong state.db.
             scopes = _bind_build_profile_scopes(profile_home)
             if profile_home:
-                session_db = _open_profile_session_db(profile_home)
+                if session_db is None:
+                    session_db = _open_profile_session_db(profile_home)
+                    current["session_db"] = session_db
+                    current["session_db_owned"] = True
             try:
                 from tui_gateway.entry import ensure_mcp_discovery_started
                 ensure_mcp_discovery_started()
@@ -1209,12 +1232,14 @@ def _start_agent_build(sid: str, session: dict) -> None:
         except Exception as e:
             from agent.auxiliary_unavailable import ProviderNotConfiguredError
             current["agent_error"] = str(e)
+            _close_owned_session_db(current)
             # A client can route "no provider is set up" to its setup flow instead of a dead-end
             # error toast — but only if it can tell. The sentence is for the reader, the code is
             # for the client; older clients keep matching the text.
             _emit("error", sid, {
                 "message": agent_init_failed_message(e),
                 **({"code": "provider_not_configured"} if isinstance(e, ProviderNotConfiguredError) else {})})
+
         finally:
             _finish_agent_build(
                 sid, key, current, notify_registered=notify_registered, scopes=scopes, session_db=session_db)
@@ -2853,9 +2878,11 @@ def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "", profile:
 def _deferred_session_record(
     session_key: str, *, cols: int, cwd: str, history: list, lease, source: str = "tui",
     close_on_disconnect: bool = False, display_history_prefix: list | None = None,
-    profile_home: Path | None = None, lazy: bool = False, model_override=None,
+    profile_home: Path | None = None, profile_name: str | None = None,
+    lazy: bool = False, model_override=None,
     resume_runtime_overrides: dict | None = None, todo_state: dict | None = None,
-    explicit_cwd: bool = False) -> dict:
+    explicit_cwd: bool = False, session_db=None, session_db_owned: bool = False,
+    session_db_pinned: bool = False) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold resume) — _init_session's shape minus the agent."""
     now = time.time()
     return {
@@ -2867,8 +2894,11 @@ def _deferred_session_record(
         "inflight_turn": None, "last_active": now, "lazy": lazy, "model_override": model_override,
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
+        "profile_name": profile_name,
         "resume_runtime_overrides": resume_runtime_overrides, "resume_session_id": session_key,
         "running": False, "session_key": session_key, "show_reasoning": _load_show_reasoning(),
+        "session_db": session_db, "session_db_owned": session_db_owned,
+        "session_db_pinned": session_db_pinned,
         "slash_worker": None, "source": source, "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {}, "todo_state": todo_state,
         "transport": current_transport() or _stdio_transport,
@@ -2898,6 +2928,7 @@ def _claim_or_reuse_live(sid: str, session_key: str, record: dict, lease) -> tup
         if live is not None:
             if lease is not None:
                 lease.release()
+            _close_owned_session_db(record)
             # The reap is cancelled by the guarded reuse (_reattach_refusal), not here: a rejected
             # reattach must leave an in-flight orphan interrupt polling.
             return live

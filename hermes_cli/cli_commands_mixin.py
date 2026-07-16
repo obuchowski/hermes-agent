@@ -844,9 +844,16 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         session_title = self._handoff_prepare_session()
         if session_title is None:
             return True
-        if not self._session_db.request_handoff(self.session_id, platform_name):
+        from hermes_cli.profiles import get_active_profile_name
+        profile_name = get_active_profile_name() or "default"
+        if not self._session_db.request_handoff(
+            self.session_id,
+            platform_name,
+            profile_name=profile_name if profile_name != "default" else None,
+        ):
             return self._handoff_keep(f"  {_t('handoff.already_in_flight')}")
-        _cp(f"  {_t('handoff.queued', title=session_title, platform=platform_name, home=home.name)}",
+        profile_suffix = f", profile: {profile_name}" if profile_name != "default" else ""
+        _cp(f"  {_t('handoff.queued', title=session_title, platform=platform_name, home=home.name + profile_suffix)}",
             f"  {_t('handoff.waiting')}")
         return self._handoff_wait(platform_name, session_title)
 
@@ -912,6 +919,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         retry (a claim racing this instant wins). RUNNING (claimed): the gateway replays the
         transcript via a synthetic turn (routinely >60s) — wait 15 min with heartbeats and on
         timeout do NOT touch the row; failing it here was the split-brain bug."""
+        from hermes_cli.profiles import get_active_profile_name
+        profile_name = get_active_profile_name() or "default"
         pending_deadline = time.time() + self._HANDOFF_PENDING_TIMEOUT
         running_deadline = None
         next_heartbeat = None
@@ -927,6 +936,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
                     _cp(f"  {_t('handoff.picked_up')}")
                     running_deadline = time.time() + self._HANDOFF_RUNNING_TIMEOUT
                     next_heartbeat = time.time() + self._HANDOFF_HEARTBEAT_EVERY
+                elif current == "transferred":
+                    _cp("  Session ownership transferred; delivering the continuation...")
                 last_state = current
             if current == "completed":
                 _cp("", f"  {_t('handoff.complete', platform=platform_name)}",
@@ -942,6 +953,13 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
                 err = (state_row or {}).get("error") or _t("handoff.unknown_error")
                 return self._handoff_keep(
                     f"  {_t('handoff.failed', error=err)}", f"  {_t('handoff.session_intact_retry')}")
+            if current == "transferred_with_warning":
+                err = (state_row or {}).get("error") or "delivery did not complete"
+                _cp(f"  Handoff transferred with a delivery warning: {err}",
+                    f"  The gateway copy is canonical. Resume with: "
+                    f"hermes -p {profile_name} --resume {self.session_id}")
+                self._should_exit = True
+                return False
             now = time.time()
             if current == "pending":
                 if now >= pending_deadline:
@@ -952,11 +970,38 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
                     next_heartbeat = now + self._HANDOFF_HEARTBEAT_EVERY
                 if running_deadline is not None and now >= running_deadline:
                     # Do NOT fail the row: the gateway owns it (split-brain bug otherwise).
-                    return self._handoff_keep(
-                        f"  {_t('handoff.taking_long')}",
-                        f"  {_t('handoff.check_platform', platform=platform_name)}",
-                        f"  {_t('handoff.no_longer_waiting')}", f"  {_t('handoff.retry_when_settled')}")
+                    break
             time.sleep(0.5)
+        # Re-read at the timeout boundary: transfer may have committed between the last poll and now.
+        try:
+            final_state = self._session_db.get_handoff_state(self.session_id) or {}
+        except Exception:
+            final_state = {}
+        if final_state.get("state") in {"transferred", "transferred_with_warning", "completed"}:
+            _cp("  Timed out waiting for delivery after ownership transferred.",
+                f"  Resume the canonical session with: "
+                f"hermes -p {profile_name} --resume {self.session_id}")
+            self._should_exit = True
+            return False
+        root_owned = False
+        if profile_name != "default":
+            try:
+                from hermes_cli.session_resolution import canonical_root_owns_session
+                root_owned = canonical_root_owns_session(
+                    self.session_id, active_profile=profile_name)
+            except Exception:
+                root_owned = None
+        if root_owned is not False:
+            message = (
+                "  Local handoff status is stale; canonical ownership transferred."
+                if root_owned else
+                "  Canonical ownership is indeterminate; refusing local continuation."
+            )
+            _cp(message,
+                f"  Resume the canonical session with: "
+                f"hermes -p {profile_name} --resume {self.session_id}")
+            self._should_exit = True
+            return False
         try:  # pending timed out: CAS-clear so the user can retry
             self._session_db.fail_handoff(
                 self.session_id, "timed out waiting for gateway", only_states=("pending",))
@@ -997,23 +1042,45 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         resolved = self._resolve_resume_target(target)
         if resolved is None:
             return
-        target_id, session_meta = resolved
+        target_id, session_meta, target_db, target_db_owned = resolved
         # A Kanban worker transcript must not become this chat's write-capable continuation
         # (#68779): the resumed conversation would be a writer the Kanban board cannot
         # observe, and unblocking the card could dispatch a competing worker. Keep the
         # CURRENT session instead of switching.
         from hermes_cli.kanban_resume_guard import kanban_resume_refusal
-        if (kanban_refusal := kanban_resume_refusal(self._session_db, target_id)):
+        if (kanban_refusal := kanban_resume_refusal(target_db, target_id)):
+            if target_db_owned:
+                with suppress(Exception):
+                    target_db.close()
             return _cp(f"  {kanban_refusal}")
-        if target_id == self.session_id:
+        if target_id == self.session_id and target_db is self._session_db:
+            if target_db_owned:
+                with suppress(Exception):
+                    target_db.close()
             return _cp(f"  {_t('resume.already_on')}")
         old_session_id = self.session_id
+        old_session_db = self._session_db
+        old_session_db_owned = getattr(self, "_session_db_owned", True)
         _end_current_session(self, "resumed_other")
+        if target_db is not old_session_db:
+            self._session_db = target_db
+            self._session_db_owned = target_db_owned
+            if self.agent:
+                self.agent._session_db = target_db
+            if old_session_db_owned:
+                with suppress(Exception):
+                    old_session_db.close()
         self.session_id, self._resumed, self._pending_title = target_id, True, None
         _sync_process_session_id(target_id)
         # One lineage SELECT, two projections: model_history is alternation-repaired for live
         # replay (heals a durable user;user once); display_history is verbatim (as startup --resume).
-        model_history, display_history = self._session_db.get_resume_conversations(target_id)
+        resume_pair = self._session_db.get_resume_conversations(target_id)
+        if isinstance(resume_pair, (tuple, list)) and len(resume_pair) == 2:
+            model_history, display_history = resume_pair
+        else:  # compatibility with lightweight/mixed-version stores
+            model_history = self._session_db.get_messages_as_conversation(
+                target_id, repair_alternation=True)
+            display_history = list(model_history or [])
         self.conversation_history = _without_session_meta(model_history)
         self._resume_display_history = _without_session_meta(display_history)
         with suppress(Exception):  # re-open the target session so it's not marked as ended
@@ -1042,7 +1109,7 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         self._restore_session_model(session_meta)
 
     def _resolve_resume_target(self, target: str):
-        """``(session_id, meta)`` for a numbered selection, title, or id; None after printing why
+        """``(session_id, meta, owning_db, owns_db)`` for a numbered selection, title, or id; None after printing why
         it could not be resolved. An empty compression-chain head redirects to the descendant
         that actually holds the transcript."""
         if target.isdigit():
@@ -1050,24 +1117,41 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
             index = int(target)
             if index < 1 or index > len(sessions):
                 return _cp(*_lines(_gt("resume.out_of_range", index=index)))
-            target_id = sessions[index - 1]["id"]
+            lookup_target = sessions[index - 1]["id"]
         else:
+            lookup_target = target
+        from hermes_cli.session_resolution import resolve_active_profile_session
+        resolved = resolve_active_profile_session(lookup_target, current_db=self._session_db)
+        if resolved is None:
+            # Compatibility seam for lightweight DB doubles and extensions patching the historical resolver.
             from hermes_cli.main import _resolve_session_by_name_or_id
-            target_id = _resolve_session_by_name_or_id(target) or target
-        session_meta = self._session_db.get_session(target_id)
+            target_id = _resolve_session_by_name_or_id(lookup_target) or lookup_target
+            target_db, target_db_owned = self._session_db, False
+        else:
+            target_id, target_db, target_db_owned = resolved.session_id, resolved.db, resolved.owns_db
+        try:
+            session_meta = target_db.get_session(target_id)
+        except Exception as exc:
+            if target_db_owned:
+                with suppress(Exception):
+                    target_db.close()
+            return _cp(f"  Could not load session {target}: {exc}")
         if not session_meta:
+            if target_db_owned:
+                with suppress(Exception):
+                    target_db.close()
             return _cp(f"  {_t('resume.not_found', target=target)}", f"  {_t('resume.not_found_hint')}")
         try:
             # If the target is the empty head of a compression chain, redirect to the descendant that
             # actually holds the transcript. See #15000.
-            resolved_id = self._session_db.resolve_resume_session_id(target_id)
+            resolved_id = target_db.resolve_resume_session_id(target_id)
         except Exception:
             resolved_id = target_id
         if resolved_id and resolved_id != target_id:
             _cp(f"  {_t('resume.compressed_redirect', session_id=target_id, resolved_id=resolved_id)}")
             target_id = resolved_id
-            session_meta = self._session_db.get_session(target_id) or session_meta
-        return target_id, session_meta
+            session_meta = target_db.get_session(target_id) or session_meta
+        return target_id, session_meta, target_db, target_db_owned
 
     def _handle_sessions_command(self, cmd_original: str) -> None:
         """Handle /sessions [list|<id_or_title>] — bare/``list`` prints the recent-sessions table;

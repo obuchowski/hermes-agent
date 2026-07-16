@@ -531,13 +531,24 @@ class GatewayAdapterLifecycleMixin:
         """Process pending CLI→gateway session handoffs from ``state.db``: claim atomically (pending
         → running), re-bind the home channel to the CLI session_id, dispatch a synthetic event, mark
         ``completed``/``failed``."""
-        from gateway.run import _async_profile_runtime_scope, _reclaim_stale, _resolve_handoff_watch_scopes
+        from gateway.run import (
+            HandoffPostCommitError,
+            _async_profile_runtime_scope,
+            _resolve_handoff_watch_scopes,
+            _reclaim_stale,
+        )
         from gateway.run_idle_gates import off_loop_gate, profile_has_pending_handoff
         await asyncio.sleep(5)  # let platforms connect before dispatching through them
-        # Does _process_handoff accept the profile argument? Test stand-ins bind a one-arg callable.
+        # Does _process_handoff accept profile-aware keyword arguments? Test stand-ins may bind a
+        # one-argument callable; never infer keyword support from raw parameter count (``**kwargs``
+        # and keyword-only parameters made that probe dispatch the profile positionally).
         try:
             import inspect as _inspect
-            _process_takes_profile = len(_inspect.signature(self._process_handoff).parameters) >= 2
+            _process_params = _inspect.signature(self._process_handoff).parameters
+            _process_takes_profile = (
+                "source_profile" in _process_params
+                or any(p.kind == _inspect.Parameter.VAR_KEYWORD for p in _process_params.values())
+            )
         except Exception:
             _process_takes_profile = False
         # In-flight dispatches by session id: a handoff is a FULL agent turn, so never process inline.
@@ -546,13 +557,26 @@ class GatewayAdapterLifecycleMixin:
         async def _dispatch(row, session_id, session_db, profile_name) -> None:
             """Run one claimed handoff to a terminal state, off the poll path."""
             try:
-                await self._process_handoff(*((row, profile_name) if _process_takes_profile else (row,)))
+                if _process_takes_profile:
+                    await self._process_handoff(
+                        row, source_profile=profile_name, source_db=session_db)
+                else:
+                    await self._process_handoff(row)
                 await session_db.complete_handoff(session_id)
             except asyncio.CancelledError:
                 # Leave the row 'running' so the next start's reclaim marks it failed with a clear reason.
                 raise
+            except HandoffPostCommitError as exc:
+                logger.warning(
+                    "Handoff for session %s transferred with warning: %s",
+                    session_id, exc, exc_info=True,
+                )
+                with _log_suppressed(
+                    logging.DEBUG, "Could not record post-transfer handoff warning", exc_info=True
+                ):
+                    await session_db.complete_handoff_with_warning(session_id, str(exc))
             except Exception as exc:
-                logger.warning("Handoff for session %s failed: %s", session_id, exc, exc_info=True)
+                logger.warning("Handoff for session %s failed before transfer: %s", session_id, exc, exc_info=True)
                 with _log_suppressed(logging.DEBUG, "Could not record handoff failure", exc_info=True):
                     await session_db.fail_handoff(session_id, str(exc))
             finally:
