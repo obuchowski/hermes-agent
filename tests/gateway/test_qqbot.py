@@ -1820,6 +1820,27 @@ class TestSendExecApproval:
             metadata={"thread_id": "ignored", "anything": "else"},
         )
 
+    @pytest.mark.asyncio
+    async def test_one_shot_rule_disables_permanent_button(self):
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def fake_send_approval(chat_id, req, reply_to=None):
+            from gateway.platforms.base import SendResult
+            captured["req"] = req
+            return SendResult(success=True)
+
+        adapter.send_approval_request = fake_send_approval  # type: ignore[assignment]
+        await adapter.send_exec_approval(
+            chat_id="u",
+            command="aws s3 ls",
+            session_key="s",
+            allow_permanent=True,
+            one_shot_only=True,
+        )
+
+        assert captured["req"].allow_permanent is False
+
 
 class TestSendUpdatePrompt:
     """Verify the cross-adapter send_update_prompt signature + behaviour."""

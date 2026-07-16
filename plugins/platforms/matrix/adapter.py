@@ -2066,6 +2066,7 @@ class MatrixAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        one_shot_only: bool = False,
     ) -> SendResult:
         """Send a reaction-based exec approval prompt for Matrix."""
         if not self._client:
@@ -2076,14 +2077,12 @@ class MatrixAdapter(BasePlatformAdapter):
         scope_choices = ""
         if smart_denied:
             scope_choices = "Smart DENY: owner override applies to this one operation only.\n"
-        else:
-            scope_choices = ""
-            if allow_session:
-                scope_choices += "Reply `!approve session` to approve this pattern for the session, "
+        elif allow_session and not one_shot_only:
+            scope_choices = "Reply `!approve session` to approve this pattern for the session, "
             if allow_permanent:
                 scope_choices += "`!approve always` to approve permanently, "
         reaction_legend_parts = ["✅ = approve once"]
-        if allow_session:
+        if allow_session and not smart_denied and not one_shot_only:
             reaction_legend_parts.append("🌀 = approve for this session")
             if allow_permanent:
                 reaction_legend_parts.append("♾️ = approve always")
@@ -2114,7 +2113,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._approval_prompts_by_event[result.message_id] = prompt
         self._approval_prompt_by_session[session_key] = result.message_id
 
-        if not allow_session:
+        if smart_denied or one_shot_only or not allow_session:
             reactions = ("✅", "❌")
         elif not allow_permanent:
             reactions = ("✅", "🌀", "❌")

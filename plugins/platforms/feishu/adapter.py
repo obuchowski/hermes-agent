@@ -2006,6 +2006,7 @@ class FeishuAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        one_shot_only: bool = False,
     ) -> SendResult:
         """Send an interactive card with approval buttons.
 
@@ -2029,7 +2030,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 }
 
             actions = [_btn("✅ Allow Once", "approve_once", "primary")]
-            if not smart_denied and allow_session:
+            if not smart_denied and allow_session and not one_shot_only:
                 actions.append(_btn("✅ Session", "approve_session"))
                 if allow_permanent:
                     actions.append(_btn("✅ Always", "approve_always"))

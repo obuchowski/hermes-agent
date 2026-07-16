@@ -2674,6 +2674,7 @@ class QQAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        one_shot_only: bool = False,
     ) -> SendResult:
         """Send a button-based exec-approval prompt for a dangerous command.
 
@@ -2698,7 +2699,9 @@ class QQAdapter(BasePlatformAdapter):
             description=description,
             command_preview=command,
             timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,
-            allow_permanent=allow_permanent and not smart_denied,
+            allow_permanent=(
+                allow_permanent and not smart_denied and not one_shot_only
+            ),
         )
         return await self.send_approval_request(
             chat_id, req, reply_to=msg_id,

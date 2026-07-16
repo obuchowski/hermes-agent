@@ -66,3 +66,30 @@ async def test_exec_approval_prompt_truncates_long_command_in_content():
     assert "... [truncated]" in sent["content"]
     assert "long generated shell command" in sent["content"]
     assert len(sent["embed"].description) > len(sent["content"])
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_one_shot_rule_hides_persistent_buttons(monkeypatch):
+    from plugins.platforms.discord import adapter as discord_module
+
+    removed = []
+    monkeypatch.setattr(
+        discord_module.ExecApprovalView,
+        "remove_item",
+        lambda _self, item: removed.append(getattr(item, "__name__", "")),
+        raising=False,
+    )
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent = _capture_channel(adapter)
+
+    result = await adapter.send_exec_approval(
+        chat_id="555",
+        command="aws s3 ls",
+        session_key="discord:555",
+        description="executable confirmation",
+        allow_permanent=False,
+        one_shot_only=True,
+    )
+
+    assert result.success is True
+    assert removed == ["allow_session", "allow_always"]

@@ -33,20 +33,22 @@ from tools import approval as approval_mod
 
 
 @pytest.mark.parametrize(
-    ("smart_denied", "allow_permanent", "expected"),
+    ("smart_denied", "allow_permanent", "one_shot_only", "expected"),
     [
-        (False, True, ["once", "session", "always", "deny"]),
-        (False, False, ["once", "session", "deny"]),
-        (True, True, ["once", "deny"]),
-        (True, False, ["once", "deny"]),
+        (False, True, False, ["once", "session", "always", "deny"]),
+        (False, False, False, ["once", "session", "deny"]),
+        (True, True, False, ["once", "deny"]),
+        (True, False, False, ["once", "deny"]),
+        (False, False, True, ["once", "deny"]),
     ],
 )
 def test_approval_event_choices_follow_backend_capabilities(
-    smart_denied, allow_permanent, expected
+    smart_denied, allow_permanent, one_shot_only, expected
 ):
     assert _approval_event_choices(
         smart_denied=smart_denied,
         allow_permanent=allow_permanent,
+        one_shot_only=one_shot_only,
     ) == expected
 
 

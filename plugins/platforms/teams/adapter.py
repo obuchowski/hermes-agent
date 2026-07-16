@@ -1101,6 +1101,7 @@ class TeamsAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        one_shot_only: bool = False,
     ) -> SendResult:
         """Send an Adaptive Card approval prompt with Allow/Deny buttons."""
         if not self._app:
@@ -1118,7 +1119,7 @@ class TeamsAdapter(BasePlatformAdapter):
             title="Allow Once", verb="hermes_approve",
             data={**btn_data_base, "hermes_action": "approve_once"}, style="positive",
         )]
-        if not smart_denied and allow_session:
+        if not smart_denied and allow_session and not one_shot_only:
             actions.append(ExecuteAction(
                 title="Allow Session", verb="hermes_approve",
                 data={**btn_data_base, "hermes_action": "approve_session"},

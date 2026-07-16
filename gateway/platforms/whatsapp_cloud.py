@@ -822,6 +822,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        one_shot_only: bool = False,
     ) -> SendResult:
         """Render a dangerous-command approval prompt with native buttons.
 
@@ -833,7 +834,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if self._http_client is None:
             return SendResult(success=False, error="Not connected")
 
-        del allow_permanent, allow_session  # This adapter already offers one-shot Approve / Deny only.
+        # This adapter already offers one-shot Approve / Deny only.
+        del allow_permanent, allow_session, one_shot_only
         # WhatsApp body caps at 1024 chars; reserve room for the
         # framing prose around the command.
         cmd = command or ""

@@ -2386,7 +2386,7 @@ def terminal_tool(
             )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
-                if approval.get("status") == "pending_approval":
+                if approval.get("status") in {"pending_approval", "approval_required"}:
                     return json.dumps({
                         "output": "",
                         "exit_code": -1,
@@ -2398,6 +2398,8 @@ def terminal_tool(
                         "pattern_key": approval.get("pattern_key", ""),
                         "smart_denied": approval.get("smart_denied", False),
                         "allow_permanent": approval.get("allow_permanent", True),
+                        "one_shot_only": approval.get("one_shot_only", False),
+                        "choices": approval.get("choices"),
                     }, ensure_ascii=False)
                 # Command was blocked
                 desc = approval.get("description", "command flagged")

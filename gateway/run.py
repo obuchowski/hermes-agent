@@ -361,6 +361,7 @@ def _format_exec_approval_fallback(
     allow_permanent: bool = True,
     allow_session: bool = True,
     smart_denied: bool = False,
+    one_shot_only: bool = False,
 ) -> str:
     """Render the text fallback from approval capabilities, not platform names."""
     cmd_preview = command[:200] + "..." if len(command) > 200 else command
@@ -369,7 +370,7 @@ def _format_exec_approval_fallback(
         heading = "⚠️ **Smart DENY — owner override for one operation:**"
 
     choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
-    if not smart_denied and allow_session:
+    if not smart_denied and allow_session and not one_shot_only:
         choices.append(
             f"`{command_prefix}approve session` to approve this pattern for the session"
         )
@@ -20836,6 +20837,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 allow_permanent=approval_data.get("allow_permanent", True),
                                 allow_session=approval_data.get("allow_session", True),
                                 smart_denied=approval_data.get("smart_denied", False),
+                                one_shot_only=approval_data.get("one_shot_only", False),
                             ),
                             _loop_for_step,
                             logger=logger,
@@ -20867,6 +20869,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     allow_permanent=approval_data.get("allow_permanent", True),
                     allow_session=approval_data.get("allow_session", True),
                     smart_denied=approval_data.get("smart_denied", False),
+                    one_shot_only=approval_data.get("one_shot_only", False),
                 )
                 try:
                     _approval_send_fut = safe_schedule_threadsafe(

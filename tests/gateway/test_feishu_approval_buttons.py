@@ -154,6 +154,33 @@ class TestFeishuExecApproval:
         assert state["chat_id"] == "oc_12345"
 
     @pytest.mark.asyncio
+    async def test_one_shot_rule_hides_all_persistent_buttons(self):
+        adapter = _make_adapter()
+        mock_response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="msg_one_shot"),
+        )
+        with patch.object(
+            adapter,
+            "_feishu_send_with_retry",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ) as mock_send:
+            await adapter.send_exec_approval(
+                chat_id="oc_12345",
+                command="aws s3 ls",
+                session_key="s",
+                allow_permanent=False,
+                one_shot_only=True,
+            )
+
+        card = json.loads(mock_send.call_args.kwargs["payload"])
+        actions = card["elements"][1]["actions"]
+        assert [action["value"]["hermes_action"] for action in actions] == [
+            "approve_once", "deny",
+        ]
+
+    @pytest.mark.asyncio
     async def test_not_connected(self):
         adapter = _make_adapter()
         adapter._client = None

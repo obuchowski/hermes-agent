@@ -183,6 +183,32 @@ TeamsSummaryWriter = _teams_mod.TeamsSummaryWriter
 check_requirements = _teams_mod.check_requirements
 check_teams_requirements = _teams_mod.check_teams_requirements
 validate_config = _teams_mod.validate_config
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_one_shot_rule_hides_persistent_buttons(monkeypatch):
+    adapter = TeamsAdapter(_make_config(
+        client_id="id", client_secret="secret", tenant_id="tenant"
+    ))
+    adapter._app = MagicMock()
+    adapter._send_card = AsyncMock(return_value=SimpleNamespace(id="message-id"))
+    actions = []
+    monkeypatch.setattr(
+        _teams_mod,
+        "ExecuteAction",
+        lambda **kwargs: actions.append(kwargs) or kwargs,
+    )
+
+    result = await adapter.send_exec_approval(
+        chat_id="conversation-id",
+        command="aws s3 ls",
+        session_key="teams:conversation-id",
+        allow_permanent=False,
+        one_shot_only=True,
+    )
+
+    assert result.success is True
+    assert [action["title"] for action in actions] == ["Allow Once", "Deny"]
 register = _teams_mod.register
 
 
