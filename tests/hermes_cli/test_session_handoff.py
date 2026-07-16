@@ -13,6 +13,7 @@ flip pending → running, and finishes with ``complete_handoff`` or
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -57,6 +58,23 @@ class TestHandoffStateDB:
             "platform": "telegram",
             "error": None,
         }
+
+    def test_request_handoff_stamps_trusted_profile_without_rewriting_owner(self, db):
+        sid = "sess-profile"
+        self._make_session(db, sid)
+        db._conn.execute(
+            "UPDATE sessions SET profile_name = '' WHERE id = ?", (sid,)
+        )
+        db._conn.commit()
+
+        assert db.request_handoff(sid, "discord", profile_name="programmer") is True
+        assert db.get_session(sid)["profile_name"] == "programmer"
+
+        db.fail_handoff(sid, "retry")
+        with pytest.raises(ValueError, match="belongs to profile 'programmer'"):
+            db.request_handoff(sid, "discord", profile_name="ula")
+
+        assert db.get_session(sid)["profile_name"] == "programmer"
 
     def test_request_handoff_rejects_in_flight(self, db):
         sid = "sess-2"
@@ -138,6 +156,24 @@ class TestHandoffStateDB:
         assert state["state"] == "failed"
         assert state["error"] == "no home channel for telegram"
 
+    def test_post_transfer_failure_never_reactivates_local_copy(self, db):
+        sid = "sess-transferred-warning"
+        self._make_session(db, sid)
+        db.request_handoff(sid, "discord", profile_name="programmer")
+        db.claim_handoff(sid)
+        db.mark_handoff_transferred(sid)
+
+        db.fail_handoff(sid, "late failure must not roll ownership back")
+        assert db.get_handoff_state(sid)["state"] == "transferred"
+
+        db.complete_handoff_with_warning(sid, "delivery exhausted retries")
+        assert db.get_handoff_state(sid) == {
+            "state": "transferred_with_warning",
+            "platform": "discord",
+            "error": "delivery exhausted retries",
+        }
+        assert db.request_handoff(sid, "discord", profile_name="programmer") is False
+
     def test_fail_handoff_truncates_long_reasons(self, db):
         sid = "sess-fail-long"
         self._make_session(db, sid)
@@ -200,3 +236,49 @@ class TestHandoffCommandRegistration:
         assert cmd is not None
         assert cmd.cli_only is True
         assert "handoff" not in GATEWAY_KNOWN_COMMANDS
+
+
+def test_named_profile_cli_command_queues_in_owning_db(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+    from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+    sid = "named-cli-handoff"
+    db = SessionDB(db_path=tmp_path / "profiles" / "programmer" / "state.db")
+    db.create_session(sid, "cli")
+    config = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(
+                enabled=True,
+                token="test",
+                home_channel=HomeChannel(
+                    platform=Platform.DISCORD,
+                    chat_id="programmer-home",
+                    name="Programmer Home",
+                ),
+            )
+        }
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "programmer"
+    )
+    monkeypatch.setattr(
+        db,
+        "get_handoff_state",
+        lambda _sid: {"state": "completed", "platform": "discord", "error": None},
+    )
+    cli = SimpleNamespace(
+        session_id=sid,
+        _session_db=db,
+        _agent_running=False,
+        _should_exit=False,
+    )
+
+    try:
+        keep_running = CLICommandsMixin._handle_handoff_command(cli, "/handoff discord")
+
+        assert keep_running is False
+        assert cli._should_exit is True
+        assert db.get_session(sid)["profile_name"] == "programmer"
+    finally:
+        db.close()
