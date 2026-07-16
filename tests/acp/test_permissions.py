@@ -24,6 +24,7 @@ def _invoke_callback(
     *,
     allow_permanent=True,
     smart_denied=False,
+    one_shot_only=False,
     timeout=60.0,
     use_prompt_path=False,
 ):
@@ -47,6 +48,7 @@ def _invoke_callback(
                 "dangerous command",
                 allow_permanent=allow_permanent,
                 smart_denied=smart_denied,
+                one_shot_only=one_shot_only,
                 approval_callback=cb,
             )
         else:
@@ -55,6 +57,7 @@ def _invoke_callback(
                 "dangerous command",
                 allow_permanent=allow_permanent,
                 smart_denied=smart_denied,
+                one_shot_only=one_shot_only,
             )
 
     scheduled["coro"].close()
@@ -138,6 +141,19 @@ class TestApprovalBridge:
         )
 
         assert result == "deny"
+        assert [option.option_id for option in kwargs["options"]] == [
+            "allow_once", "deny",
+        ]
+
+    def test_one_shot_prompt_only_offers_once_and_deny(self):
+        result, kwargs, _, _, _ = _invoke_callback(
+            AllowedOutcome(option_id="allow_once", outcome="selected"),
+            allow_permanent=False,
+            one_shot_only=True,
+            use_prompt_path=True,
+        )
+
+        assert result == "once"
         assert [option.option_id for option in kwargs["options"]] == [
             "allow_once", "deny",
         ]

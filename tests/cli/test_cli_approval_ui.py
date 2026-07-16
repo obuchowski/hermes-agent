@@ -99,6 +99,14 @@ class TestCliApprovalUi:
             "rm -rf /tmp/example", allow_permanent=False, smart_denied=False
         ) == ["once", "session", "deny"]
 
+    def test_one_shot_callback_offers_only_once_and_deny(self):
+        cli = _make_cli_stub()
+        assert cli._approval_choices(
+            "aws s3 ls",
+            allow_permanent=False,
+            one_shot_only=True,
+        ) == ["once", "deny"]
+
     def test_sudo_prompt_restores_existing_draft_after_response(self):
         cli = _make_cli_stub()
         cli._app.current_buffer = _FakeBuffer("draft command", cursor_position=5)
@@ -768,4 +776,3 @@ class TestClearOverlaysForInterrupt:
 
         assert not t.is_alive(), "worker thread never unblocked"
         assert result["value"] == "deny"
-

@@ -4938,6 +4938,7 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         allow_permanent: bool = True,
         smart_denied: bool = False,
+        one_shot_only: bool = False,
     ) -> SendResult:
         """Send an inline-keyboard approval prompt with interactive buttons.
 
@@ -4971,7 +4972,7 @@ class TelegramAdapter(BasePlatformAdapter):
             buttons = [
                 InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}")
             ]
-            if not smart_denied:
+            if not smart_denied and not one_shot_only:
                 buttons.append(
                     InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}")
                 )

@@ -3794,6 +3794,7 @@ class SlackAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         allow_permanent: bool = True,
         smart_denied: bool = False,
+        one_shot_only: bool = False,
     ) -> SendResult:
         """Send a Block Kit approval prompt with interactive buttons.
 
@@ -3829,7 +3830,7 @@ class SlackAdapter(BasePlatformAdapter):
                     "value": session_key,
                 },
             ]
-            if not smart_denied:
+            if not smart_denied and not one_shot_only:
                 actions.append({
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Allow Session"},

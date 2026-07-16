@@ -58,3 +58,34 @@ class TestMatrixExecApprovalReactions:
         mock_resolve.assert_called_once_with("sess-1", "once")
         assert "$target" not in adapter._approval_prompts_by_event
         assert "sess-1" not in adapter._approval_prompt_by_session
+
+    @pytest.mark.asyncio
+    async def test_one_shot_rule_omits_persistent_text_and_reaction(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@liizfq:liizfq.top")
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = MatrixAdapter(PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={"homeserver": "https://matrix.example.org"},
+        ))
+        adapter._client = types.SimpleNamespace()
+        adapter.send = AsyncMock(
+            return_value=types.SimpleNamespace(success=True, message_id="$evt1")
+        )
+        adapter._send_reaction = AsyncMock(return_value="$r")
+
+        await adapter.send_exec_approval(
+            chat_id="!room:example.org",
+            command="aws s3 ls",
+            session_key="sess-1",
+            description="executable confirmation",
+            allow_permanent=False,
+            one_shot_only=True,
+        )
+
+        text = adapter.send.await_args.args[1]
+        assert "approve session" not in text
+        assert "approve always" not in text
+        emojis = [call.args[2] for call in adapter._send_reaction.await_args_list]
+        assert emojis == ["✅", "❌"]

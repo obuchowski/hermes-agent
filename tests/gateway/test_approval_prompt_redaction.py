@@ -145,7 +145,11 @@ class TestApprovalCommandWiring:
             and node.func.attr == "send_exec_approval"
         )
         keywords = {kw.arg: kw.value for kw in call.keywords}
-        for name, default in (("allow_permanent", True), ("smart_denied", False)):
+        for name, default in (
+            ("allow_permanent", True),
+            ("smart_denied", False),
+            ("one_shot_only", False),
+        ):
             value = keywords[name]
             assert isinstance(value, ast.Call)
             assert isinstance(value.func, ast.Attribute) and value.func.attr == "get"
@@ -175,6 +179,18 @@ class TestApprovalTextFallbackContract:
             allow_permanent=False, smart_denied=False,
         )
         assert "`!approve session`" in text
+        assert "approve always" not in text
+
+    def test_one_shot_rule_only_advertises_one_operation(self):
+        from gateway.run import _format_exec_approval_fallback
+
+        text = _format_exec_approval_fallback(
+            "aws s3 ls", "executable confirmation", "/",
+            allow_permanent=False,
+            one_shot_only=True,
+        )
+        assert "`/approve`" in text
+        assert "approve session" not in text
         assert "approve always" not in text
 
     def test_manual_prompt_preserves_all_choices(self):

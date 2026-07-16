@@ -11767,14 +11767,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
     def _approval_callback(self, command: str, description: str,
                            *, allow_permanent: bool = True,
-                           smart_denied: bool = False) -> str:
+                           smart_denied: bool = False,
+                           one_shot_only: bool = False) -> str:
         """
         Prompt for dangerous command approval through the prompt_toolkit UI.
 
         Called from the agent thread. Shows a selection UI similar to clarify
         with choices: once / session / always / deny. Smart DENY owner
-        overrides show only once / deny. When allow_permanent is False for
-        another reason (for example tirith), only 'always' is hidden.
+        overrides and executable-confirm rules show only once / deny. When
+        allow_permanent is False for another reason (for example tirith),
+        only 'always' is hidden.
         Long commands also get a 'view' option so the full command can be
         expanded before deciding.
 
@@ -11795,6 +11797,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     command,
                     allow_permanent=allow_permanent,
                     smart_denied=smart_denied,
+                    one_shot_only=one_shot_only,
                 ),
                 "selected": 0,
                 "response_queue": response_queue,
@@ -11842,9 +11845,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return "deny"
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True,
-                          smart_denied: bool = False) -> list[str]:
+                          smart_denied: bool = False,
+                          one_shot_only: bool = False) -> list[str]:
         """Return approval choices for a dangerous command prompt."""
-        if smart_denied:
+        if smart_denied or one_shot_only:
             choices = ["once", "deny"]
         else:
             choices = ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]

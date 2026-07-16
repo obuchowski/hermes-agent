@@ -1744,6 +1744,7 @@ class TestSendExecApprovalButtons:
             command="rm -rf /tmp/foo",
             session_key="sess-app-1",
             description="cleanup script",
+            one_shot_only=True,
         )
 
         assert result.success

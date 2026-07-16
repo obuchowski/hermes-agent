@@ -149,6 +149,30 @@ class TestTelegramExecApproval:
         assert buttons == ["✅ Allow Once", "✅ Session", "❌ Deny"]
 
     @pytest.mark.asyncio
+    async def test_one_shot_rule_hides_all_persistent_buttons(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+        buttons = []
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, callback_data: buttons.append(text) or text,
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows
+        )
+
+        await adapter.send_exec_approval(
+            chat_id="12345",
+            command="aws s3 ls",
+            session_key="s",
+            allow_permanent=False,
+            one_shot_only=True,
+        )
+
+        assert buttons == ["✅ Allow Once", "❌ Deny"]
+        assert "Smart DENY" not in adapter._bot.send_message.call_args.kwargs["text"]
+
+    @pytest.mark.asyncio
     async def test_stores_approval_state(self):
         adapter = _make_adapter()
         mock_msg = MagicMock()

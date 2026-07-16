@@ -140,6 +140,25 @@ class TestSlackExecApproval:
         assert "one operation" in kwargs["blocks"][0]["text"]["text"].lower()
 
     @pytest.mark.asyncio
+    async def test_one_shot_rule_hides_all_persistent_buttons(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+
+        await adapter.send_exec_approval(
+            chat_id="C1",
+            command="aws s3 ls",
+            session_key="s",
+            allow_permanent=False,
+            one_shot_only=True,
+        )
+
+        elements = mock_client.chat_postMessage.call_args.kwargs["blocks"][1]["elements"]
+        assert [element["action_id"] for element in elements] == [
+            "hermes_approve_once", "hermes_deny",
+        ]
+
+    @pytest.mark.asyncio
     async def test_sends_in_thread(self):
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]

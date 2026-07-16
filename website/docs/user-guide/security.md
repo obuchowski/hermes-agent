@@ -34,6 +34,7 @@ approvals:
   mode: smart                     # smart | manual | off
   timeout: 60                     # seconds to wait for user response (default: 60)
   cron_mode: deny                 # deny | approve — what cron jobs do when they hit a dangerous command
+  confirm: []                     # executables that always need one-shot human approval
   mcp_reload_confirm: true        # /reload-mcp asks before invalidating the MCP tool cache
   destructive_slash_confirm: true # /clear, /new, /reset, /undo prompt before discarding state
 ```
@@ -44,7 +45,8 @@ The full set of keys:
 |---|---|---|
 | `mode` | `smart` | Approval policy for dangerous shell commands — see the table below. |
 | `timeout` | `60` | Seconds Hermes waits for an approval reply before timing out. |
-| `cron_mode` | `deny` | How [cron jobs](./features/cron.md) behave headlessly when they trigger a dangerous-command prompt. `deny` blocks the command (the agent must find another path); `approve` auto-approves everything in cron context. |
+| `cron_mode` | `deny` | How [cron jobs](./features/cron.md) behave headlessly when they trigger an ordinary dangerous-command prompt. `deny` blocks the command (the agent must find another path); `approve` auto-approves it. An `approvals.confirm` match always blocks because cron has no live approval surface. |
+| `confirm` | `[]` | Executable rules that require fresh, one-shot human approval even when normal approvals are bypassed. Matching cron and headless invocations fail closed. |
 | `mcp_reload_confirm` | `true` | When true, `/reload-mcp` asks before rebuilding the MCP tool set. Rebuilding invalidates the provider prompt cache (tool schemas live in the system prompt), so the next message re-sends full input tokens. Users who click **Always Approve** flip this key to `false`. |
 | `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. TUI uses its own modal overlay (set `HERMES_TUI_NO_CONFIRM=1` to opt out there). |
 
@@ -52,15 +54,15 @@ The full set of keys:
 |------|----------|
 | **smart** (default) | Use an auxiliary LLM to assess risk. Low-risk commands (e.g., `python -c "print('hello')"`) are auto-approved for that command only. Genuinely dangerous commands are auto-denied. Uncertain cases escalate to a manual prompt. |
 | **manual** | Always prompt the user for approval on dangerous commands. |
-| **off** | Disable all approval checks — equivalent to running with `--yolo`. All commands execute without prompts. |
+| **off** | Disable ordinary approval checks — equivalent to running with `--yolo`. The hardline floor, `approvals.deny`, and `approvals.confirm` still apply. |
 
 :::warning
-Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
+Setting `approvals.mode: off` disables ordinary safety prompts. Always-on hardline, deny, and executable-confirm policy remains active. Use only in trusted environments (CI/CD, containers, etc.).
 :::
 
 ### YOLO Mode
 
-YOLO mode bypasses **all** dangerous command approval prompts for the current session. It can be activated three ways:
+YOLO mode bypasses ordinary dangerous command approval prompts for the current session. Always-on hardline blocks, `approvals.deny`, and `approvals.confirm` remain active. YOLO can be activated three ways:
 
 1. **CLI flag**: Start a session with `hermes --yolo` or `hermes chat --yolo`
 2. **Slash command**: Type `/yolo` during a session to toggle it on/off
@@ -84,7 +86,7 @@ When YOLO is active, Hermes shows two persistent visual reminders so it's hard t
 - A `⚠ YOLO` fragment in the status bar across all width tiers, updated live as you toggle YOLO on or off (rich-text renderer and plain-text fallback).
 
 :::danger
-YOLO mode disables **all** dangerous command safety checks for the session — **except** the hardline blocklist (see below). Use only when you fully trust the commands being generated (e.g., well-tested automation scripts in disposable environments).
+YOLO mode disables ordinary dangerous command safety checks for the session — **except** the hardline blocklist, `approvals.deny`, and `approvals.confirm` (see below). Use only when you fully trust the commands being generated (e.g., well-tested automation scripts in disposable environments).
 :::
 
 For destructive session slash commands (`/clear`, `/new` / `/reset`, `/undo`, `/quit --delete` — `/exit --delete` is an alias), the CLI also prompts for confirmation before running them. See [Slash Commands — Confirmation prompts for destructive commands](../reference/slash-commands.md#confirmation-prompts-for-destructive-commands).
@@ -136,6 +138,28 @@ Like the rest of the approval config, changes take effect immediately (the confi
 :::note Threat model
 Deny rules are a guardrail against an honest-but-wrong agent, the same threat model as the dangerous-pattern detector. They are not a sandbox against a deliberately adversarial process — for that, use an isolated backend (Docker, Modal) or an egress-restricted environment.
 :::
+
+### Executable Confirmation Rules (`approvals.confirm`)
+
+`approvals.confirm` lets an operator keep YOLO behavior while requiring a human decision every time selected executables run. For example:
+
+```yaml
+approvals:
+  mode: off
+  cron_mode: approve
+  confirm:
+    - executable: aws
+```
+
+Rules are checked in this order: the built-in hardline floor and `approvals.deny` block first; executable confirmation runs next; only then do process/session YOLO, `mode: off`, command allowlists, smart approval, and `cron_mode` apply. Consequently, neither an existing session/permanent allowlist nor an **Approve session**/**Always approve** response can bypass a confirm rule.
+
+Each mapping needs one non-empty `executable` string. Matching is case-insensitive against the executable basename at real shell command positions. `aws`, `/usr/local/bin/aws`, `sudo aws`, `env AWS_PROFILE=prod aws`, pipelines, chains, and subshells match; arguments and similarly named programs such as `echo aws`, `aws-vault`, `myaws`, and `/tmp/aws-helper` do not. Malformed entries are ignored. Isolated container backends retain their existing guard bypass, but Docker sessions with host mounts are protected.
+
+Interactive CLI and gateway sessions receive the normal approval UI with only **Allow once** and **Deny**. The choice is never persisted, even if an older client sends `session` or `always`; the next invocation prompts again. The existing approval timeout still defaults to **60 seconds**, and a timeout denies the operation.
+
+Cron has no live approval surface, so a matching executable is **BLOCKED** even with `cron_mode: approve`. A headless non-interactive run without a gateway also fails closed. Non-matching dangerous cron commands retain the configured `cron_mode` behavior.
+
+For `execute_code`, Hermes parses the script with Python's `ast` module before the normal YOLO/mode-off bypass. It recognizes literal `subprocess.run`, `call`, `check_call`, `check_output`, and `Popen` calls whose list/tuple first item is a matching executable, literal shell commands passed with `shell=True`, and literal `os.system` shell commands. Standard `os`/`subprocess` import aliases and simple local bindings to literal command strings/lists are followed while respecting reassignment and scope shadowing. It does not execute or evaluate the script during inspection, and dynamic expressions, mere strings, comments, `boto3`, and invalid syntax are not inferred; calls through `hermes_tools.terminal` are guarded separately when terminal executes them.
 
 ### Approval Timeout
 

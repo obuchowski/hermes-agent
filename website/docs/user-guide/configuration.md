@@ -1956,12 +1956,12 @@ approvals:
 |------|----------|
 | `smart` (default) | Use an auxiliary LLM to assess whether a flagged command is actually dangerous. Low-risk commands are auto-approved for that command only. Genuinely risky commands are denied; uncertain decisions escalate to the user. |
 | `manual` | Prompt the user before executing any flagged command. In the CLI, shows an interactive approval dialog. In messaging, queues a pending approval request. |
-| `off` | Skip all approval checks. Equivalent to `HERMES_YOLO_MODE=true`. **Use with caution.** |
+| `off` | Skip ordinary approval checks. Equivalent to `HERMES_YOLO_MODE=true`; hardline blocks, `approvals.deny`, and `approvals.confirm` still apply. **Use with caution.** |
 
 Smart mode is particularly useful for reducing approval fatigue — it lets the agent work more autonomously on safe operations while still catching genuinely destructive commands.
 
 :::warning
-Setting `approvals.mode: off` disables all safety checks for terminal commands. Only use this in trusted, sandboxed environments.
+Setting `approvals.mode: off` disables ordinary safety checks for terminal commands. Always-on hardline, deny, and executable-confirm policy remains active. Only use this in trusted, sandboxed environments.
 :::
 
 ### Deny rules
@@ -1976,6 +1976,23 @@ approvals:
 ```
 
 Patterns are case-insensitive fnmatch globs and must be quoted in YAML (a bare leading `*` is a parse error). See [Security — User-Defined Deny Rules](/user-guide/security#user-defined-deny-rules-approvalsdeny) for details.
+
+### Executable confirmation rules
+
+Use `approvals.confirm` to require a fresh human approval for selected executable basenames while leaving ordinary approvals off:
+
+```yaml
+approvals:
+  mode: off
+  timeout: 60       # approval timeout remains 60 seconds by default
+  cron_mode: approve
+  confirm:
+    - executable: aws
+```
+
+The precedence is hardline blocklist → `approvals.deny` → `approvals.confirm` → YOLO/`mode: off` → command allowlists → smart approval → `cron_mode`. A confirm match therefore always presents a one-shot **Allow once / Deny** prompt in interactive or gateway sessions; session/always approval is neither offered nor persisted. Cron and headless runs fail closed for a match, including when `cron_mode: approve`, while non-matching cron commands keep the existing behavior.
+
+Matching is case-insensitive by executable basename and uses shell command positions, including wrappers, environment assignments, chains, pipelines, and subshells. `execute_code` also inspects direct literal Python `subprocess.run`/`call`/`check_call`/`check_output`/`Popen` arguments and literal `os.system` commands using `ast`; it does not infer dynamic expressions or execute the script. See [Security — Executable Confirmation Rules](/user-guide/security#executable-confirmation-rules-approvalsconfirm) for the exact scope and false-positive boundaries.
 
 ## Checkpoints
 

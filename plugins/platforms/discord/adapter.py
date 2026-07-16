@@ -5592,6 +5592,7 @@ class DiscordAdapter(BasePlatformAdapter):
         metadata: Optional[dict] = None,
         allow_permanent: bool = True,
         smart_denied: bool = False,
+        one_shot_only: bool = False,
     ) -> SendResult:
         """
         Send a button-based exec approval prompt for a dangerous command.
@@ -5667,6 +5668,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 admin_user_ids=admin_user_ids,
                 allow_permanent=allow_permanent,
                 smart_denied=smart_denied,
+                one_shot_only=one_shot_only,
             )
 
             send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
@@ -6919,6 +6921,7 @@ def _define_discord_view_classes() -> None:
             admin_user_ids: Optional[set] = None,
             allow_permanent: bool = True,
             smart_denied: bool = False,
+            one_shot_only: bool = False,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
@@ -6932,7 +6935,7 @@ def _define_discord_view_classes() -> None:
                 str(a).strip() for a in (admin_user_ids or set()) if str(a).strip()
             }
             self.resolved = False
-            if smart_denied:
+            if smart_denied or one_shot_only:
                 self.remove_item(self.allow_session)
                 self.remove_item(self.allow_always)
             elif not allow_permanent:

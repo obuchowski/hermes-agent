@@ -1,4 +1,6 @@
-"""Regression tests for sudo detection and sudo password handling."""
+"""Regression tests for sudo detection and terminal approval payloads."""
+
+import json
 
 import tools.terminal_tool as terminal_tool
 
@@ -28,6 +30,30 @@ def test_terminal_schema_advertises_persistent_env_state():
     assert "exported environment variables persist between calls" in description
     assert "activate a virtualenv" in description
     assert "do not re-source the same environment before every command" in description
+
+
+def test_pending_approval_preserves_one_shot_policy(monkeypatch):
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda *_args, **_kwargs: {
+            "approved": False,
+            "status": "approval_required",
+            "command": "aws s3 ls",
+            "description": "AWS confirmation",
+            "pattern_key": "executable-confirm:aws",
+            "allow_permanent": False,
+            "one_shot_only": True,
+            "choices": ["once", "deny"],
+        },
+    )
+
+    payload = json.loads(terminal_tool.terminal_tool("aws s3 ls"))
+
+    assert payload["status"] == "pending_approval"
+    assert payload["allow_permanent"] is False
+    assert payload["one_shot_only"] is True
+    assert payload["choices"] == ["once", "deny"]
 
 
 def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):

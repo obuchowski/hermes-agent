@@ -2589,11 +2589,13 @@ DEFAULT_CONFIG = {
     # Approval mode for dangerous commands:
     #   manual — always prompt the user
     #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
-    #   off    — skip all approval prompts (equivalent to --yolo)
+    #   off    — skip ordinary approval prompts (equivalent to --yolo;
+    #            hardline, deny, and confirm rules still apply)
     #
     # cron_mode — what to do when a cron job hits a dangerous command:
     #   deny    — block the command and let the agent find another way (default, safe)
-    #   approve — auto-approve all dangerous commands in cron jobs
+    #   approve — auto-approve ordinary dangerous commands in cron jobs;
+    #             confirm-rule matches still fail closed
     "approvals": {
         "mode": "smart",
         "timeout": 60,
@@ -2608,6 +2610,14 @@ DEFAULT_CONFIG = {
         #     - "git push --force*"
         #     - "*curl*|*sh*"
         "deny": [],
+        # Per-executable one-shot confirmation rules. These run before YOLO,
+        # mode=off, command allowlists, smart approval, and cron_mode. Every
+        # matching host-side invocation needs fresh human approval; cron and
+        # headless sessions fail closed because no live approval is possible.
+        # Match is case-insensitive by executable basename. Example:
+        #   confirm:
+        #     - executable: aws
+        "confirm": [],
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates
         # the provider prompt cache (tool schemas are baked into the system
