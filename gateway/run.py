@@ -1435,6 +1435,10 @@ class SecondaryPortBindingConfigError(MultiplexConfigError):
     """A secondary profile conflicts with the multiplexer's shared listener."""
 
 
+class HandoffPostCommitError(RuntimeError):
+    """A handoff transferred storage ownership but did not finish delivery."""
+
+
 @_contextmanager
 def _profile_runtime_scope(profile_home: "Path"):
     """Scope config/skills/memory AND credentials to a profile for one turn.
@@ -2927,6 +2931,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        self._handoff_profile_dbs: Dict[str, Any] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -7650,36 +7655,102 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if self._session_db is None:
                     await asyncio.sleep(interval)
                     continue
-                pending = await self._session_db.list_pending_handoffs()
-                for row in pending:
-                    session_id = row.get("id")
-                    if not session_id:
-                        continue
-                    if not await self._session_db.claim_handoff(session_id):
-                        # Another tick or another gateway already claimed it.
-                        continue
-                    try:
-                        await self._process_handoff(row)
-                        await self._session_db.complete_handoff(session_id)
-                    except Exception as exc:
-                        logger.warning(
-                            "Handoff for session %s failed: %s",
-                            session_id, exc, exc_info=True,
-                        )
-                        await self._session_db.fail_handoff(session_id, str(exc))
+                seen_ids: set[str] = set()
+                for source_profile, source_db, source_scope in GatewayRunner._handoff_sources(self):
+                    pending = await source_db.list_pending_handoffs()
+                    for row in pending:
+                        session_id = str(row.get("id") or "").strip()
+                        if not session_id or session_id in seen_ids:
+                            continue
+                        seen_ids.add(session_id)
+                        row_profile = str(row.get("profile_name") or "").strip()
+                        effective_profile = row_profile or source_profile or "default"
+                        if source_scope == "profile" and row_profile != source_profile:
+                            await source_db.claim_handoff(session_id)
+                            await source_db.fail_handoff(
+                                session_id,
+                                f"handoff profile ownership mismatch: expected {source_profile!r}",
+                            )
+                            continue
+                        if not await source_db.claim_handoff(session_id):
+                            # Another tick or another gateway already claimed it.
+                            continue
+                        try:
+                            await self._process_handoff(
+                                row,
+                                source_profile=effective_profile,
+                                source_db=source_db,
+                            )
+                            await source_db.complete_handoff(session_id)
+                        except HandoffPostCommitError as exc:
+                            logger.warning(
+                                "Handoff for session %s transferred with warning: %s",
+                                session_id, exc, exc_info=True,
+                            )
+                            await source_db.complete_handoff_with_warning(
+                                session_id, str(exc)
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Handoff for session %s failed before transfer: %s",
+                                session_id, exc, exc_info=True,
+                            )
+                            await source_db.fail_handoff(session_id, str(exc))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.debug("Handoff watcher tick error: %s", exc, exc_info=True)
             await asyncio.sleep(interval)
 
-    async def _process_handoff(self, row: Dict[str, Any]) -> None:
+    def _handoff_sources(self) -> list[tuple[str, Any, str]]:
+        """Return root plus profile-local DBs served by this gateway."""
+        if self._session_db is None:
+            return []
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return [("default", self._session_db, "gateway_root")]
+
+        from hermes_cli.profiles import get_active_profile_name, profiles_to_serve
+        from hermes_state import AsyncSessionDB, SessionDB
+
+        active = get_active_profile_name() or "default"
+        sources: list[tuple[str, Any, str]] = [
+            (active, self._session_db, "gateway_root")
+        ]
+        handles = getattr(self, "_handoff_profile_dbs", None)
+        if handles is None:
+            handles = self._handoff_profile_dbs = {}
+        for profile_name, profile_home in profiles_to_serve(multiplex=True):
+            if profile_name == active:
+                continue
+            handle = handles.get(profile_name)
+            if handle is None:
+                handle = AsyncSessionDB(SessionDB(db_path=Path(profile_home) / "state.db"))
+                handles[profile_name] = handle
+            sources.append((profile_name, handle, "profile"))
+        return sources
+
+    async def _process_handoff(
+        self,
+        row: Dict[str, Any],
+        *,
+        source_profile: Optional[str] = None,
+        source_db: Any = None,
+    ) -> None:
         """Execute one handoff row. Raises on failure (caller marks failed)."""
-        from gateway.config import Platform
+        from gateway.config import Platform, load_gateway_config
         from gateway.session import SessionSource, build_session_key
         from gateway.platforms.base import MessageEvent
+        from hermes_cli.profiles import get_active_profile_name, get_profile_dir
 
         cli_session_id = row["id"]
+        source_profile = str(
+            source_profile or row.get("profile_name") or "default"
+        ).strip() or "default"
+        row_profile = str(row.get("profile_name") or "").strip()
+        if row_profile and row_profile != source_profile:
+            raise RuntimeError(
+                f"session belongs to profile {row_profile!r}, not {source_profile!r}"
+            )
         platform_name = (row.get("handoff_platform") or "").strip().lower()
         if not platform_name:
             raise RuntimeError("handoff_platform is empty")
@@ -7690,15 +7761,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except (ValueError, KeyError):
             raise RuntimeError(f"unknown platform '{platform_name}'")
 
-        # Adapter must be live
-        adapter = self.adapters.get(platform)
+        multiplex = bool(getattr(self.config, "multiplex_profiles", False))
+        active_profile = get_active_profile_name() or "default"
+        profile_home = None
+        profile_config = self.config
+        if multiplex and source_profile != active_profile:
+            profile_home = get_profile_dir(source_profile)
+            adapter = getattr(self, "_profile_adapters", {}).get(
+                source_profile, {}
+            ).get(platform)
+            if not adapter:
+                raise RuntimeError(
+                    f"platform '{platform_name}' for profile {source_profile!r} "
+                    "is not active in this gateway"
+                )
+            with _profile_runtime_scope(profile_home):
+                profile_config = load_gateway_config()
+        else:
+            adapter = self.adapters.get(platform)
         if not adapter:
             raise RuntimeError(
                 f"platform '{platform_name}' is not active in this gateway"
             )
 
         # Home channel must be configured
-        home = self.config.get_home_channel(platform)
+        home = profile_config.get_home_channel(platform)
         if not home or not home.chat_id:
             raise RuntimeError(
                 f"no home channel configured for {platform_name}; "
@@ -7731,6 +7818,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         effective_thread_id = new_thread_id or (
             str(home.thread_id) if home.thread_id else None
         )
+
+        # Irreversible commit: copy the complete compression lineage into the
+        # gateway root DB before binding or replay.  Once this succeeds the
+        # source row is marked transferred so no timeout/error can revive it.
+        source_db = source_db or self._session_db
+        source_sync = getattr(source_db, "_db", source_db)
+        root_sync = getattr(self._session_db, "_db", self._session_db)
+        lineage_committed = False
+        source_status_error: Optional[Exception] = None
+        if source_sync is not root_sync:
+            transfer_result = await self._session_db.transfer_session_lineage_from(
+                source_sync,
+                cli_session_id,
+                profile_name=source_profile,
+            )
+            if not transfer_result.get("ok"):
+                raise RuntimeError(
+                    f"could not transfer session lineage: {transfer_result.get('errors') or transfer_result}"
+                )
+            lineage_committed = True
+        try:
+            await source_db.mark_handoff_transferred(cli_session_id)
+        except Exception as exc:
+            if lineage_committed:
+                source_status_error = exc
+                logger.warning(
+                    "Handoff source status write failed after canonical transfer for %s: %s",
+                    cli_session_id,
+                    exc,
+                )
+            else:
+                raise
 
         # Determine chat_type/user_id for the destination source.
         #
@@ -7765,6 +7884,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=dest_user_id,
             user_name="Handoff",
             thread_id=effective_thread_id,
+            profile=source_profile if multiplex else None,
         )
 
         # Compute the gateway's session_key for that destination using the
@@ -7772,85 +7892,125 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # entry. For thread destinations build_session_key keys without
         # user_id (thread_sessions_per_user defaults to False) — so the
         # next real user message in the thread shares this same session.
-        platform_cfg = self.config.platforms.get(platform)
+        platform_cfg = profile_config.platforms.get(platform)
         extra = platform_cfg.extra if platform_cfg else {}
         session_key = build_session_key(
             dest_source,
             group_sessions_per_user=extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+            profile=source_profile if multiplex else None,
         )
 
         # Make sure there's an entry in the session_store for this key. If
         # the home channel has never been used, get_or_create_session
         # creates one; switch_session then re-points it.
-        await self.async_session_store.get_or_create_session(dest_source)
+        try:
+            await self.async_session_store.get_or_create_session(dest_source)
 
         # Re-bind the destination key to the CLI session_id. switch_session
         # ends the prior session in SQLite and reopens the CLI session under
         # the new key. The CLI's transcript becomes the active one for the
         # gateway from this moment on.
-        switched = await self.async_session_store.switch_session(session_key, cli_session_id)
-        if switched is None:
-            raise RuntimeError(
-                f"could not switch session key {session_key} → {cli_session_id}"
-            )
+            switched = await self.async_session_store.switch_session(session_key, cli_session_id)
+            if switched is None:
+                raise RuntimeError(
+                    f"could not switch session key {session_key} → {cli_session_id}"
+                )
 
         # Evict any cached AIAgent for this session_key so the next dispatch
         # rebuilds it against the CLI session_id (mirrors /resume / /branch).
-        self._evict_cached_agent(session_key)
+            self._evict_cached_agent(session_key)
 
         # Cancel any in-flight running-agent state for the destination key
         # so the synthetic turn isn't queued behind a stale running flag.
-        self._release_running_agent_state(session_key)
+            self._release_running_agent_state(session_key)
 
-        synthetic_text = (
-            f"[Session was just handed off from CLI (\"{cli_title}\") to this "
-            f"channel. The full prior conversation history is loaded above. "
-            f"Briefly confirm you're working here and summarize what we were "
-            f"working on, so the user can continue from this device.]"
-        )
+            synthetic_text = (
+                f"[Session was just handed off from CLI (\"{cli_title}\") to this "
+                f"channel. The full prior conversation history is loaded above. "
+                f"Briefly confirm you're working here and summarize what we were "
+                f"working on, so the user can continue from this device.]"
+            )
 
-        synthetic_event = MessageEvent(
-            text=synthetic_text,
-            source=dest_source,
-            internal=True,
-        )
+            synthetic_event = MessageEvent(
+                text=synthetic_text,
+                source=dest_source,
+                internal=True,
+            )
 
-        logger.info(
-            "Handoff: dispatching synthetic turn for CLI session %s → %s "
-            "(home=%s, thread=%s, session_key=%s)",
-            cli_session_id, platform_name, home.chat_id, effective_thread_id,
-            session_key,
-        )
+            logger.info(
+                "Handoff: dispatching synthetic turn for CLI session %s profile=%s → %s "
+                "(home=%s, thread=%s, session_key=%s, commit=transferred)",
+                cli_session_id, source_profile, platform_name, home.chat_id,
+                effective_thread_id, session_key,
+            )
 
         # Dispatch through the runner directly. Going through
         # adapter.handle_message would spawn a background task and we'd
         # lose synchronous error visibility; calling _handle_message inline
         # keeps the success/failure path observable for the watcher.
-        response_text = await self._handle_message(synthetic_event)
-        if not response_text:
-            # Streaming may have already delivered the response inline.
-            # Either way, agent ran without raising — count as success.
+            response_text = None
+            last_exc = None
+            for attempt in range(2):
+                try:
+                    if profile_home is not None:
+                        with _profile_runtime_scope(profile_home):
+                            response_text = await self._handle_message(synthetic_event)
+                    else:
+                        response_text = await self._handle_message(synthetic_event)
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt == 0:
+                        logger.warning(
+                            "Handoff delivery retry for session %s profile=%s: %s",
+                            cli_session_id, source_profile, exc,
+                        )
+            else:
+                raise last_exc or RuntimeError("handoff agent dispatch failed")
+
+            if not response_text:
+                # Streaming may have already delivered the response inline.
+                if source_status_error is not None:
+                    raise HandoffPostCommitError(
+                        "delivery completed after canonical transfer, but source "
+                        f"status could not be updated: {source_status_error}"
+                    ) from source_status_error
+                return
+
+            send_metadata: Dict[str, Any] = {}
+            if effective_thread_id:
+                send_metadata["thread_id"] = effective_thread_id
+            for attempt in range(2):
+                try:
+                    result = await adapter.send(
+                        chat_id=str(home.chat_id),
+                        content=response_text,
+                        metadata=send_metadata or None,
+                    )
+                    if not getattr(result, "success", True):
+                        err = getattr(result, "error", "send returned success=False")
+                        raise RuntimeError(f"adapter.send failed: {err}")
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt == 0:
+                        logger.warning(
+                            "Handoff send retry for session %s profile=%s: %s",
+                            cli_session_id, source_profile, exc,
+                        )
+            else:
+                raise last_exc or RuntimeError("handoff send failed")
+            if source_status_error is not None:
+                raise HandoffPostCommitError(
+                    "delivery completed after canonical transfer, but source "
+                    f"status could not be updated: {source_status_error}"
+                ) from source_status_error
             return
-
-        # Send the agent's reply to the destination. Route to the new
-        # thread if we created one; otherwise the configured home channel
-        # (which may itself carry a thread_id).
-        send_metadata: Dict[str, Any] = {}
-        if effective_thread_id:
-            send_metadata["thread_id"] = effective_thread_id
-        try:
-            result = await adapter.send(
-                chat_id=str(home.chat_id),
-                content=response_text,
-                metadata=send_metadata or None,
-            )
+        except HandoffPostCommitError:
+            raise
         except Exception as exc:
-            raise RuntimeError(f"adapter.send failed: {exc}") from exc
-
-        if not getattr(result, "success", True):
-            err = getattr(result, "error", "send returned success=False")
-            raise RuntimeError(f"adapter.send failed: {err}")
+            raise HandoffPostCommitError(str(exc)) from exc
 
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.
@@ -8519,6 +8679,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _amap.clear()
             if hasattr(self, "_profile_adapters"):
                 self._profile_adapters.clear()
+            for _profile, _db in list(
+                getattr(self, "_handoff_profile_dbs", {}).items()
+            ):
+                try:
+                    await _db.close()
+                except Exception:
+                    logger.debug(
+                        "Could not close handoff DB for profile %s",
+                        _profile,
+                        exc_info=True,
+                    )
+            if hasattr(self, "_handoff_profile_dbs"):
+                self._handoff_profile_dbs.clear()
             logger.info(
                 "Shutdown phase: all adapters disconnected at +%.2fs",
                 _phase_elapsed(),

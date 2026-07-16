@@ -2233,6 +2233,201 @@ class TestDeleteAndExport:
         finally:
             target.close()
 
+    def test_transfer_session_lineage_from_preserves_history_and_profile(self, db, tmp_path):
+        db.create_session(
+            session_id="compressed-parent",
+            source="cli",
+            model="test-model",
+            cwd="/workspace/project",
+            profile_name="programmer",
+        )
+        db.append_message("compressed-parent", role="user", content="before compression")
+        db.end_session("compressed-parent", "compression")
+        db.create_session(
+            session_id="handoff-tip",
+            source="cli",
+            parent_session_id="compressed-parent",
+            cwd="/workspace/project",
+            profile_name="programmer",
+        )
+        db.append_message(
+            "handoff-tip",
+            role="assistant",
+            content="after compression",
+            tool_calls=[{"id": "call-1", "function": {"name": "noop"}}],
+            reasoning_details=[{"type": "summary", "text": "kept"}],
+        )
+        db.append_message("handoff-tip", role="user", content="rewound draft")
+        db._conn.execute(
+            "UPDATE messages SET active = 0, compacted = 1 "
+            "WHERE session_id = 'handoff-tip' AND content = 'rewound draft'"
+        )
+        db._conn.commit()
+        db.request_handoff("handoff-tip", "discord")
+
+        target = SessionDB(db_path=tmp_path / "gateway_state.db")
+        try:
+            result = target.transfer_session_lineage_from(
+                db,
+                "handoff-tip",
+                profile_name="programmer",
+            )
+
+            assert result == {
+                "ok": True,
+                "session_id": "handoff-tip",
+                "transferred_ids": ["compressed-parent", "handoff-tip"],
+                "already_present_ids": [],
+            }
+            assert target.get_compression_lineage("handoff-tip") == [
+                "compressed-parent",
+                "handoff-tip",
+            ]
+            assert target.get_session("compressed-parent")["profile_name"] == "programmer"
+            transferred_tip = target.get_session("handoff-tip")
+            assert transferred_tip["profile_name"] == "programmer"
+            assert transferred_tip["cwd"] == "/workspace/project"
+            assert transferred_tip["handoff_state"] is None
+            assert transferred_tip["handoff_platform"] is None
+            parent_messages = target.get_messages_as_conversation("compressed-parent")
+            assert [message["role"] for message in parent_messages] == ["user"]
+            assert parent_messages[0]["content"] == "before compression"
+            tip_messages = target.get_messages_as_conversation("handoff-tip")
+            assert [message["role"] for message in tip_messages] == ["assistant"]
+            assert tip_messages[0]["tool_calls"][0]["id"] == "call-1"
+            assert tip_messages[0]["reasoning_details"][0]["text"] == "kept"
+            all_tip_messages = target.get_messages(
+                "handoff-tip", include_inactive=True
+            )
+            assert all_tip_messages[-1]["content"] == "rewound draft"
+            assert all_tip_messages[-1]["active"] == 0
+            assert all_tip_messages[-1]["compacted"] == 1
+        finally:
+            target.close()
+
+    def test_transfer_session_lineage_retry_is_idempotent_and_collision_fails_closed(
+        self, db, tmp_path
+    ):
+        db.create_session("handoff-tip", "cli", profile_name="programmer")
+        db.append_message("handoff-tip", role="user", content="canonical source")
+        target = SessionDB(db_path=tmp_path / "gateway_state.db")
+        try:
+            first = target.transfer_session_lineage_from(
+                db, "handoff-tip", profile_name="programmer"
+            )
+            retry = target.transfer_session_lineage_from(
+                db, "handoff-tip", profile_name="programmer"
+            )
+
+            assert first["transferred_ids"] == ["handoff-tip"]
+            assert retry["transferred_ids"] == []
+            assert retry["already_present_ids"] == ["handoff-tip"]
+            assert [
+                message["content"]
+                for message in target.get_messages_as_conversation("handoff-tip")
+            ] == ["canonical source"]
+
+            other = SessionDB(db_path=tmp_path / "other_profile.db")
+            try:
+                other.create_session("collision", "cli", profile_name="ula")
+                other.append_message("collision", role="user", content="other profile")
+                target.create_session("collision", "discord", profile_name="programmer")
+
+                with pytest.raises(ValueError, match="belongs to profile 'ula'"):
+                    target.transfer_session_lineage_from(
+                        other, "collision", profile_name="programmer"
+                    )
+            finally:
+                other.close()
+        finally:
+            target.close()
+
+    def test_transfer_session_lineage_retry_rejects_divergence_atomically(
+        self, db, tmp_path
+    ):
+        db.create_session("handoff-tip", "cli", profile_name="programmer")
+        db.append_message("handoff-tip", role="user", content="old")
+        target = SessionDB(db_path=tmp_path / "gateway_state.db")
+        try:
+            target.transfer_session_lineage_from(
+                db, "handoff-tip", profile_name="programmer"
+            )
+
+            db.append_message("handoff-tip", role="assistant", content="new")
+            db.create_session(
+                "new-parent",
+                "cli",
+                profile_name="programmer",
+            )
+            db.append_message("new-parent", role="user", content="parent history")
+            db.end_session("new-parent", "compression")
+            db._conn.execute(
+                "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+                ("new-parent", "handoff-tip"),
+            )
+            db._conn.commit()
+
+            with pytest.raises(ValueError, match="handoff-tip.*diverges"):
+                target.transfer_session_lineage_from(
+                    db, "handoff-tip", profile_name="programmer"
+                )
+
+            assert target.get_session("new-parent") is None
+            assert target.get_session("handoff-tip")["parent_session_id"] is None
+            assert [
+                message["content"]
+                for message in target.get_messages_as_conversation("handoff-tip")
+            ] == ["old"]
+        finally:
+            target.close()
+
+    @pytest.mark.parametrize(
+        ("field", "source_value", "destination_value"),
+        [
+            ("model_config", {"nested": {"value": True}}, {"nested": {"value": 1}}),
+            ("tool_calls", [{"function": {"arguments": {"nested": True}}}],
+             [{"function": {"arguments": {"nested": 1}}}]),
+            ("reasoning_details", [{"type": "detail", "nested": [True]}],
+             [{"type": "detail", "nested": [1]}]),
+        ],
+    )
+    def test_trusted_transfer_retry_uses_type_strict_nested_json_equality(
+        self, db, tmp_path, field, source_value, destination_value
+    ):
+        session_kwargs = {"profile_name": "programmer"}
+        if field == "model_config":
+            session_kwargs["model_config"] = destination_value
+        db.create_session("handoff-tip", "cli", **session_kwargs)
+        message_kwargs = {}
+        if field != "model_config":
+            message_kwargs[field] = destination_value
+        db.append_message(
+            "handoff-tip", role="assistant", content="same text", **message_kwargs
+        )
+        target = SessionDB(db_path=tmp_path / "gateway_state.db")
+        try:
+            target.transfer_session_lineage_from(
+                db, "handoff-tip", profile_name="programmer"
+            )
+            if field == "model_config":
+                db._conn.execute(
+                    "UPDATE sessions SET model_config = ? WHERE id = ?",
+                    (json.dumps(source_value), "handoff-tip"),
+                )
+            else:
+                db._conn.execute(
+                    f"UPDATE messages SET {field} = ? WHERE session_id = ?",
+                    (json.dumps(source_value), "handoff-tip"),
+                )
+            db._conn.commit()
+
+            with pytest.raises(ValueError, match="trusted transfer payload diverges"):
+                target.transfer_session_lineage_from(
+                    db, "handoff-tip", profile_name="programmer"
+                )
+        finally:
+            target.close()
+
     def test_import_sessions_restores_valid_parents_and_detaches_missing(self, db):
         result = db.import_sessions(
             [

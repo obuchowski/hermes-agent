@@ -21,6 +21,189 @@ def _make_cli():
 
 
 class TestCliResumeCommand:
+    def test_handoff_timeout_refuses_stale_local_state_when_root_is_canonical(self):
+        cli_obj = _make_cli()
+        cli_obj._agent_running = False
+        cli_obj._should_exit = False
+        cli_obj._session_db.get_session.return_value = {
+            "id": "current_session",
+            "title": "Canonical chat",
+        }
+        cli_obj._session_db.request_handoff.return_value = True
+        cli_obj._session_db.get_handoff_state.return_value = {
+            "state": "running",
+            "platform": "discord",
+            "error": None,
+        }
+        platform_cfg = SimpleNamespace(enabled=True)
+        home = SimpleNamespace(chat_id="home", name="Discord Home")
+        config = SimpleNamespace(
+            platforms={},
+            get_home_channel=lambda _platform: home,
+        )
+        from gateway.config import Platform
+
+        config.platforms[Platform.DISCORD] = platform_cfg
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("hermes_cli.profiles.get_active_profile_name", return_value="programmer"),
+            patch("time.time", side_effect=[0.0, 61.0]),
+            patch("time.sleep"),
+            patch(
+                "hermes_cli.session_resolution.canonical_root_owns_session",
+                return_value=True,
+                create=True,
+            ),
+            patch("cli._cprint") as printed,
+        ):
+            keep_running = cli_obj._handle_handoff_command("/handoff discord")
+
+        assert keep_running is False
+        assert cli_obj._should_exit is True
+        cli_obj._session_db.fail_handoff.assert_not_called()
+        output = "\n".join(str(call.args[0]) for call in printed.call_args_list)
+        assert "canonical" in output.lower()
+        assert "resume" in output.lower()
+
+    def test_handoff_timeout_fails_closed_when_root_ownership_is_indeterminate(self):
+        cli_obj = _make_cli()
+        cli_obj._agent_running = False
+        cli_obj._should_exit = False
+        cli_obj._session_db.get_session.return_value = {
+            "id": "current_session",
+            "title": "Indeterminate chat",
+        }
+        cli_obj._session_db.request_handoff.return_value = True
+        cli_obj._session_db.get_handoff_state.return_value = {
+            "state": "running",
+            "platform": "discord",
+            "error": None,
+        }
+        platform_cfg = SimpleNamespace(enabled=True)
+        home = SimpleNamespace(chat_id="home", name="Discord Home")
+        config = SimpleNamespace(
+            platforms={},
+            get_home_channel=lambda _platform: home,
+        )
+        from gateway.config import Platform
+
+        config.platforms[Platform.DISCORD] = platform_cfg
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("hermes_cli.profiles.get_active_profile_name", return_value="programmer"),
+            patch("time.time", side_effect=[0.0, 61.0]),
+            patch("time.sleep"),
+            patch(
+                "hermes_cli.session_resolution.canonical_root_owns_session",
+                side_effect=OSError("canonical database temporarily unavailable"),
+                create=True,
+            ),
+            patch("cli._cprint") as printed,
+        ):
+            keep_running = cli_obj._handle_handoff_command("/handoff discord")
+
+        assert keep_running is False
+        assert cli_obj._should_exit is True
+        cli_obj._session_db.fail_handoff.assert_not_called()
+        assert cli_obj._session_db.get_handoff_state.return_value["state"] == "running"
+        output = "\n".join(str(call.args[0]) for call in printed.call_args_list)
+        assert "indeterminate" in output.lower()
+        assert "canonical" in output.lower()
+
+    def test_handle_resume_swaps_cli_and_agent_to_canonical_owner(self):
+        cli_obj = _make_cli()
+        old_db = cli_obj._session_db
+        root_db = MagicMock()
+        root_db.get_session.return_value = {
+            "id": "gateway-owned",
+            "title": "Programmer Discord",
+        }
+        root_db.resolve_resume_session_id.return_value = "gateway-owned"
+        root_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "continued on Discord"}
+        ]
+        agent = MagicMock()
+        agent._session_db = old_db
+        cli_obj.agent = agent
+
+        from hermes_cli.session_resolution import ResolvedSessionRef
+
+        resolved = ResolvedSessionRef(
+            session_id="gateway-owned",
+            profile_name="programmer",
+            storage_scope="gateway_root",
+            db=root_db,
+            owns_db=True,
+        )
+        with (
+            patch(
+                "hermes_cli.session_resolution.resolve_active_profile_session",
+                return_value=resolved,
+            ),
+            patch("cli._cprint"),
+        ):
+            cli_obj._handle_resume_command("/resume gateway-owned")
+
+        agent._flush_messages_to_session_db.assert_called_once_with([])
+        old_db.end_session.assert_called_once_with("current_session", "resumed_other")
+        assert cli_obj._session_db is root_db
+        assert agent._session_db is root_db
+        assert cli_obj.session_id == "gateway-owned"
+        assert cli_obj.conversation_history == [
+            {"role": "user", "content": "continued on Discord"}
+        ]
+        old_db.close.assert_called_once_with()
+
+    def test_handle_resume_closes_new_owner_when_selected_row_disappears(self):
+        cli_obj = _make_cli()
+        target_db = MagicMock()
+        target_db.get_session.return_value = None
+        from hermes_cli.session_resolution import ResolvedSessionRef
+
+        resolved = ResolvedSessionRef(
+            session_id="vanished",
+            profile_name="programmer",
+            storage_scope="gateway_root",
+            db=target_db,
+            owns_db=True,
+        )
+        with (
+            patch(
+                "hermes_cli.session_resolution.resolve_active_profile_session",
+                return_value=resolved,
+            ),
+            patch("cli._cprint"),
+        ):
+            cli_obj._handle_resume_command("/resume vanished")
+
+        target_db.close.assert_called_once_with()
+        assert cli_obj._session_db is not target_db
+
+    def test_handle_resume_never_closes_borrowed_obsolete_db(self):
+        cli_obj = _make_cli()
+        old_db = cli_obj._session_db
+        cli_obj._session_db_owned = False
+        target_db = MagicMock()
+        target_db.get_session.return_value = {"id": "target", "title": "Target"}
+        target_db.resolve_resume_session_id.return_value = "target"
+        target_db.get_messages_as_conversation.return_value = []
+        from hermes_cli.session_resolution import ResolvedSessionRef
+
+        resolved = ResolvedSessionRef(
+            "target", "programmer", "gateway_root", target_db, owns_db=True
+        )
+        with (
+            patch(
+                "hermes_cli.session_resolution.resolve_active_profile_session",
+                return_value=resolved,
+            ),
+            patch("cli._cprint"),
+        ):
+            cli_obj._handle_resume_command("/resume target")
+
+        old_db.close.assert_not_called()
+        assert cli_obj._session_db is target_db
+
     def test_show_recent_sessions_includes_indexes_and_resume_hint(self, capsys):
         cli_obj = _make_cli()
         cli_obj._list_recent_sessions = MagicMock(return_value=[

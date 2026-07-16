@@ -4068,13 +4068,20 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
-        """Insert *messages* as fresh active rows for *session_id*.
+    def _insert_message_rows(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        preserve_state: bool = False,
+    ) -> tuple[int, int]:
+        """Insert message rows, optionally retaining trusted archive state.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
         :meth:`archive_and_compact` (soft-archive-then-insert). Runs inside the
-        caller's write transaction (takes the live ``conn``). Returns
-        ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
+        caller's write transaction (takes the live ``conn``). Returns active
+        ``(message_count, tool_call_count)``. Does NOT touch sessions.* counters
         — the caller owns that, since the two flows reconcile counts differently.
         """
         now_ts = time.time()
@@ -4116,12 +4123,18 @@ class SessionDB:
                 msg.get("platform_message_id") or msg.get("message_id")
             )
 
+            active_value = 1
+            compacted_value = 0
+            if preserve_state:
+                active_value = 1 if msg.get("active", 1) else 0
+                compacted_value = 1 if msg.get("compacted", 0) else 0
+
             conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, compacted)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -4140,11 +4153,13 @@ class SessionDB:
                     codex_message_items_json,
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
-                    1,
+                    active_value,
+                    compacted_value,
                 ),
             )
-            inserted += 1
-            if tool_calls is not None:
+            if active_value:
+                inserted += 1
+            if active_value and tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
@@ -5744,7 +5759,236 @@ class SessionDB:
             item["session_id"] = session_id
         return item
 
+    @staticmethod
+    def _semantic_json_value(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return value
+
+    @staticmethod
+    def _strict_json_equal(left: Any, right: Any) -> bool:
+        """Compare decoded JSON values without Python's bool/number coercion."""
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, dict):
+            return (
+                left.keys() == right.keys()
+                and all(
+                    SessionDB._strict_json_equal(value, right[key])
+                    for key, value in left.items()
+                )
+            )
+        if isinstance(left, list):
+            return len(left) == len(right) and all(
+                SessionDB._strict_json_equal(lvalue, rvalue)
+                for lvalue, rvalue in zip(left, right)
+            )
+        return left == right
+
+    def _trusted_transfer_matches(
+        self,
+        conn,
+        session: Dict[str, Any],
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        """Return whether an existing row is the same trusted transfer state."""
+        session_id = str(session.get("id") or "").strip()
+        existing = conn.execute(
+            "SELECT * FROM sessions WHERE id = ? LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if existing is None:
+            return False
+
+        existing_session = dict(existing)
+        expected_session = {
+            "source": str(session.get("source") or "import"),
+            "user_id": session.get("user_id"),
+            "model": session.get("model"),
+            "model_config": self._semantic_json_value(session.get("model_config")),
+            "system_prompt": session.get("system_prompt"),
+            "parent_session_id": session.get("parent_session_id"),
+            "started_at": self._float_or_none(session.get("started_at")),
+            "ended_at": self._float_or_none(session.get("ended_at")),
+            "end_reason": session.get("end_reason"),
+            "input_tokens": self._int_or_default(session.get("input_tokens")),
+            "output_tokens": self._int_or_default(session.get("output_tokens")),
+            "cache_read_tokens": self._int_or_default(
+                session.get("cache_read_tokens")
+            ),
+            "cache_write_tokens": self._int_or_default(
+                session.get("cache_write_tokens")
+            ),
+            "reasoning_tokens": self._int_or_default(
+                session.get("reasoning_tokens")
+            ),
+            "cwd": session.get("cwd"),
+            "git_branch": session.get("git_branch"),
+            "git_repo_root": session.get("git_repo_root"),
+            "billing_provider": session.get("billing_provider"),
+            "billing_base_url": session.get("billing_base_url"),
+            "billing_mode": session.get("billing_mode"),
+            "estimated_cost_usd": self._float_or_none(
+                session.get("estimated_cost_usd")
+            ),
+            "actual_cost_usd": self._float_or_none(session.get("actual_cost_usd")),
+            "cost_status": session.get("cost_status"),
+            "cost_source": session.get("cost_source"),
+            "pricing_version": session.get("pricing_version"),
+            "title": session.get("title"),
+            "api_call_count": self._int_or_default(session.get("api_call_count")),
+            "archived": 1 if session.get("archived") else 0,
+        }
+        for field, expected in expected_session.items():
+            actual = existing_session.get(field)
+            if field == "model_config":
+                actual = self._semantic_json_value(actual)
+            if (
+                not self._strict_json_equal(actual, expected)
+                if field == "model_config"
+                else actual != expected
+            ):
+                return False
+
+        existing_rows = conn.execute(
+            "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        if len(existing_rows) != len(messages):
+            return False
+
+        json_fields = (
+            "tool_calls",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+        )
+        for existing_row, message in zip(existing_rows, messages):
+            role = message.get("role", "unknown")
+            expected_message = {
+                "role": role,
+                "content": message.get("content"),
+                "tool_call_id": message.get("tool_call_id"),
+                "tool_calls": message.get("tool_calls") or None,
+                "tool_name": message.get("tool_name"),
+                "effect_disposition": message.get("effect_disposition"),
+                "timestamp": self._float_or_none(message.get("timestamp")),
+                "token_count": message.get("token_count"),
+                "finish_reason": message.get("finish_reason"),
+                "reasoning": message.get("reasoning") if role == "assistant" else None,
+                "reasoning_content": (
+                    message.get("reasoning_content") if role == "assistant" else None
+                ),
+                "reasoning_details": (
+                    message.get("reasoning_details") if role == "assistant" else None
+                ) or None,
+                "codex_reasoning_items": (
+                    message.get("codex_reasoning_items")
+                    if role == "assistant"
+                    else None
+                ) or None,
+                "codex_message_items": (
+                    message.get("codex_message_items")
+                    if role == "assistant"
+                    else None
+                ) or None,
+                "platform_message_id": (
+                    message.get("platform_message_id") or message.get("message_id")
+                ),
+                "observed": 1 if message.get("observed") else 0,
+                "active": 1 if message.get("active", 1) else 0,
+                "compacted": 1 if message.get("compacted", 0) else 0,
+            }
+            actual_message = dict(existing_row)
+            actual_message["content"] = self._decode_content(
+                actual_message.get("content")
+            )
+            for field in json_fields:
+                expected_message[field] = self._semantic_json_value(
+                    expected_message[field]
+                )
+                actual_message[field] = self._semantic_json_value(
+                    actual_message.get(field)
+                )
+            if any(
+                (
+                    not self._strict_json_equal(actual_message.get(field), expected)
+                    if field in json_fields
+                    else actual_message.get(field) != expected
+                )
+                for field, expected in expected_message.items()
+            ):
+                return False
+        return True
+
     def import_sessions(self, sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Import conversation history without live profile ownership."""
+        return self._import_sessions(sessions)
+
+    def transfer_session_lineage_from(
+        self,
+        source_db: "SessionDB",
+        session_id: str,
+        *,
+        profile_name: str,
+    ) -> Dict[str, Any]:
+        """Copy one compression lineage into this DB with trusted ownership.
+
+        This is the internal storage handoff used when a profile-local CLI
+        session becomes gateway-owned.  Public JSON imports deliberately do
+        not preserve ``profile_name``; this path derives it from the gateway's
+        profile registry and rejects cross-profile ID collisions.
+        """
+        profile_name = str(profile_name or "").strip()
+        if not profile_name:
+            raise ValueError("profile_name is required")
+
+        exported = source_db.export_session_lineage(session_id)
+        if not exported:
+            raise ValueError(f"session not found: {session_id}")
+        segments = exported.get("segments") or []
+        if not segments:
+            raise ValueError(f"session lineage is empty: {session_id}")
+
+        transfer_payload: List[Dict[str, Any]] = []
+        for segment in segments:
+            segment = dict(segment)
+            segment_id = str(segment.get("id") or "").strip()
+            source_profile = str(segment.get("profile_name") or "").strip()
+            if source_profile and source_profile != profile_name:
+                raise ValueError(
+                    f"session {segment_id} belongs to profile {source_profile!r}, "
+                    f"not {profile_name!r}"
+                )
+            segment["messages"] = source_db.get_messages(
+                segment_id, include_inactive=True
+            )
+            transfer_payload.append(segment)
+
+        result = self._import_sessions(
+            transfer_payload,
+            trusted_profile_name=profile_name,
+            preserve_message_state=True,
+        )
+        if not result.get("ok"):
+            return result
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "transferred_ids": list(result.get("imported_ids") or []),
+            "already_present_ids": list(result.get("skipped_ids") or []),
+        }
+
+    def _import_sessions(
+        self,
+        sessions: List[Dict[str, Any]],
+        *,
+        trusted_profile_name: Optional[str] = None,
+        preserve_message_state: bool = False,
+    ) -> Dict[str, Any]:
         """Import sessions exported by :meth:`export_session` or ``export_all``.
 
         Existing session IDs are skipped. Imported child sessions keep their
@@ -5919,10 +6163,22 @@ class SessionDB:
                 messages = item["messages"]
                 session_id = str(raw.get("id") or "").strip()
                 exists = conn.execute(
-                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                    "SELECT profile_name FROM sessions WHERE id = ? LIMIT 1",
                     (session_id,),
                 ).fetchone()
                 if exists:
+                    if trusted_profile_name is not None:
+                        existing_profile = str(exists["profile_name"] or "").strip()
+                        if existing_profile != trusted_profile_name:
+                            raise ValueError(
+                                f"session {session_id} already belongs to profile "
+                                f"{existing_profile or 'default'!r}"
+                            )
+                        if not self._trusted_transfer_matches(conn, raw, messages):
+                            raise ValueError(
+                                f"session {session_id} trusted transfer payload diverges "
+                                "from the existing destination state"
+                            )
                     skipped_ids.append(session_id)
                     continue
 
@@ -5940,7 +6196,8 @@ class SessionDB:
                            cwd, git_branch, git_repo_root,
                            billing_provider, billing_base_url, billing_mode,
                            estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
-                           pricing_version, title, api_call_count, archived
+                           pricing_version, title, api_call_count, archived,
+                           profile_name
                        )
                        VALUES (
                            :id, :source, :user_id, :model, :model_config,
@@ -5951,7 +6208,7 @@ class SessionDB:
                            :billing_provider, :billing_base_url, :billing_mode,
                            :estimated_cost_usd, :actual_cost_usd, :cost_status,
                            :cost_source, :pricing_version, :title,
-                           :api_call_count, :archived
+                           :api_call_count, :archived, :profile_name
                        )""",
                     {
                         "id": session_id,
@@ -5992,6 +6249,7 @@ class SessionDB:
                         "title": raw.get("title"),
                         "api_call_count": self._int_or_default(raw.get("api_call_count")),
                         "archived": archived,
+                        "profile_name": trusted_profile_name,
                     },
                 )
 
@@ -6010,6 +6268,7 @@ class SessionDB:
                     conn,
                     session_id,
                     sanitized_messages,
+                    preserve_state=preserve_message_state,
                 )
                 conn.execute(
                     "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
@@ -7312,27 +7571,54 @@ class SessionDB:
     #   None       — no handoff in flight
     #   "pending"  — CLI requested handoff, gateway hasn't picked it up yet
     #   "running"  — gateway is processing (session switch + synthetic turn)
+    #   "transferred"— root DB owns the transcript; delivery is still running
     #   "completed"— gateway successfully delivered the synthetic turn
+    #   "transferred_with_warning" — root owns it, but delivery exhausted retries
     #   "failed"   — gateway hit an error; reason in handoff_error
     #
     # The CLI writes "pending" then poll-waits for terminal state. The gateway
     # watcher transitions pending→running→{completed,failed}.
 
-    def request_handoff(self, session_id: str, platform: str) -> bool:
+    def request_handoff(
+        self,
+        session_id: str,
+        platform: str,
+        *,
+        profile_name: Optional[str] = None,
+    ) -> bool:
         """Mark a session as pending handoff to the given platform.
 
         Returns True if the row was found and not already in flight; False if
-        the session is already in a non-terminal handoff state.
+        the session is already in a non-terminal handoff state.  A trusted
+        named-profile caller may fill previously-missing ownership, but can
+        never rewrite an existing owner.
         """
+        trusted_profile = str(profile_name or "").strip() or None
+
         def _do(conn):
+            row = conn.execute(
+                "SELECT profile_name FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            existing_profile = str(row["profile_name"] or "").strip()
+            if trusted_profile and existing_profile and existing_profile != trusted_profile:
+                raise ValueError(
+                    f"session {session_id} belongs to profile {existing_profile!r}, "
+                    f"not {trusted_profile!r}"
+                )
             cur = conn.execute(
                 "UPDATE sessions "
                 "SET handoff_state = 'pending', "
                 "    handoff_platform = ?, "
-                "    handoff_error = NULL "
+                "    handoff_error = NULL, "
+                "    profile_name = CASE "
+                "        WHEN profile_name IS NULL OR TRIM(profile_name) = '' THEN ? "
+                "        ELSE profile_name END "
                 "WHERE id = ? AND (handoff_state IS NULL "
                 "                  OR handoff_state IN ('completed', 'failed'))",
-                (platform, session_id),
+                (platform, trusted_profile, session_id),
             )
             return cur.rowcount > 0
         return self._execute_write(_do)
@@ -7396,12 +7682,34 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def mark_handoff_transferred(self, session_id: str) -> None:
+        """Record the irreversible ownership commit before delivery."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET handoff_state = 'transferred', "
+                "handoff_error = NULL WHERE id = ? AND handoff_state = 'running'",
+                (session_id,),
+            )
+        self._execute_write(_do)
+
+    def complete_handoff_with_warning(self, session_id: str, error: str) -> None:
+        """Finish a committed handoff without reactivating its local copy."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET handoff_state = 'transferred_with_warning', "
+                "handoff_error = ? WHERE id = ? "
+                "AND handoff_state IN ('running', 'transferred')",
+                (error[:500], session_id),
+            )
+        self._execute_write(_do)
+
     def fail_handoff(self, session_id: str, error: str) -> None:
-        """Mark a handoff as failed and record the reason."""
+        """Fail a pre-commit handoff and keep its source DB authoritative."""
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'failed', "
-                "handoff_error = ? WHERE id = ?",
+                "handoff_error = ? WHERE id = ? "
+                "AND handoff_state IN ('pending', 'running')",
                 (error[:500], session_id),
             )
         self._execute_write(_do)

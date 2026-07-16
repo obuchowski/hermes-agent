@@ -130,6 +130,38 @@ def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
         server._sessions.pop(sid, None)
 
 
+def test_handoff_state_refuses_stale_local_pending_when_root_is_canonical(monkeypatch):
+    class DbContext:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_handoff_state(self, _key):
+            return {"state": "running", "platform": "discord", "error": None}
+
+    sid = "stale-local-handoff"
+    server._sessions[sid] = {
+        "session_key": "canonical",
+        "profile_home": "/profile",
+        "profile_name": "programmer",
+    }
+    try:
+        monkeypatch.setattr(server, "_session_db", lambda _session: DbContext())
+        monkeypatch.setattr(
+            "hermes_cli.session_resolution.canonical_root_owns_session",
+            lambda *_args, **_kwargs: True,
+            raising=False,
+        )
+        result = server._methods["handoff.state"]("r", {"session_id": sid})
+        assert result["result"]["state"] == "completed"
+        assert "canonical" in result["result"]["error"].lower()
+        assert "resume" in result["result"]["error"].lower()
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_dashboard_process_isolation_config_defaults_without_default_merge(monkeypatch):
     """tui_gateway.server::_load_cfg is raw YAML, so defaults live at read site."""
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
@@ -1511,6 +1543,211 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     assert captured["agent_session_id"] == "cont_tip"
     texts = [m.get("text") for m in resp["result"]["messages"]]
     assert "post-compression reply" in texts
+
+
+def test_session_resume_named_profile_finds_canonical_root_owner(
+    monkeypatch, tmp_path
+):
+    from hermes_state import SessionDB
+
+    root_home = tmp_path / ".hermes"
+    profile_home = root_home / "profiles" / "programmer"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    local_db = SessionDB(db_path=profile_home / "state.db")
+    root_db = SessionDB(db_path=root_home / "state.db")
+    root_db.create_session(
+        "handoff-session",
+        source="discord",
+        profile_name="programmer",
+        cwd="/projects/hermes",
+    )
+    root_db.append_message(
+        "handoff-session", role="user", content="continued from Discord"
+    )
+    captured = {}
+
+    def fake_make_agent(sid, key, session_id=None, session_db=None, **kwargs):
+        captured["session_db"] = session_db
+        captured["session_id"] = session_id
+        return types.SimpleNamespace(model="test", provider="test")
+
+    monkeypatch.setattr(server, "_get_db", lambda: local_db)
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "programmer")
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda agent, *a: {"model": "test", "tools": {}, "skills": {}},
+    )
+    monkeypatch.setattr(
+        server,
+        "_init_session",
+        lambda sid, key, agent, history, cols=80, **kwargs: captured.update(
+            history=history
+        ),
+    )
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "owner-aware",
+                "method": "session.resume",
+                "params": {"session_id": "handoff-session", "eager_build": True},
+            }
+        )
+
+        assert "error" not in response
+        assert captured["session_db"].db_path == root_db.db_path
+        assert captured["session_id"] == "handoff-session"
+        assert [message["content"] for message in captured["history"]] == [
+            "continued from Discord"
+        ]
+    finally:
+        local_db.close()
+        root_db.close()
+
+
+@pytest.mark.parametrize("lazy", [False, True])
+def test_deferred_named_profile_resume_pins_root_db_through_build_and_teardown(
+    monkeypatch, tmp_path, lazy
+):
+    from unittest.mock import MagicMock
+    from hermes_state import SessionDB
+
+    root_home = tmp_path / ".hermes"
+    profile_home = root_home / "profiles" / "programmer"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    local_db = SessionDB(db_path=profile_home / "state.db")
+    seed_root = SessionDB(db_path=root_home / "state.db")
+    seed_root.create_session(
+        "canonical-deferred", "discord", profile_name="programmer"
+    )
+    seed_root.append_message(
+        "canonical-deferred", role="user", content="root transcript"
+    )
+    seed_root.close()
+
+    monkeypatch.setattr(server, "_get_db", lambda: local_db)
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "programmer")
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_child_run_active", lambda _key: False)
+    monkeypatch.setattr(server, "_set_session_context", lambda _key: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_args: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {"model": "test"})
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_SlashWorker",
+        MagicMock(side_effect=RuntimeError("disabled in ownership test")),
+    )
+
+    class ImmediateThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
+    captured = {}
+    agent = types.SimpleNamespace(model="test", provider="test")
+
+    def fake_make_agent(_sid, _key, **kwargs):
+        captured.update(kwargs)
+        return agent
+
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    response = server.handle_request(
+        {
+            "id": "deferred-owner",
+            "method": "session.resume",
+            "params": {"session_id": "canonical-deferred", "lazy": lazy},
+        }
+    )
+    sid = response["result"]["session_id"]
+    record = server._sessions[sid]
+    owner_db = record["session_db"]
+    assert owner_db.db_path == root_home / "state.db"
+    assert record["session_db_owned"] is True
+    owner_db.close = MagicMock(wraps=owner_db.close)
+    try:
+        server._start_agent_build(sid, record)
+        assert captured["session_db"] is owner_db
+        server._close_session_by_id(sid)
+        owner_db.close.assert_called_once_with()
+    finally:
+        server._sessions.pop(sid, None)
+        local_db.close()
+
+
+def test_deferred_resume_race_discard_closes_owned_db(monkeypatch):
+    from unittest.mock import MagicMock
+
+    owner_db = MagicMock()
+    record = server._deferred_session_record(
+        "same-key",
+        cols=80,
+        cwd="/tmp",
+        history=[],
+        lease=None,
+        session_db=owner_db,
+        session_db_owned=True,
+    )
+    winner = {"session_key": "same-key"}
+    monkeypatch.setattr(server, "_find_live_session_by_key", lambda _key: ("winner", winner))
+
+    assert server._claim_or_reuse_live("loser", "same-key", record, None) == (
+        "winner",
+        winner,
+    )
+    owner_db.close.assert_called_once_with()
+
+
+def test_session_list_named_profile_merges_only_matching_root_rows(
+    monkeypatch, tmp_path
+):
+    from hermes_state import SessionDB
+
+    root_home = tmp_path / ".hermes"
+    profile_home = root_home / "profiles" / "programmer"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    local_db = SessionDB(db_path=profile_home / "state.db")
+    root_db = SessionDB(db_path=root_home / "state.db")
+    local_db.create_session("local", source="tui", profile_name="programmer")
+    root_db.create_session("owned-root", source="discord", profile_name="programmer")
+    root_db.create_session("other-root", source="discord", profile_name="ula")
+    monkeypatch.setattr(server, "_get_db", lambda: local_db)
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "programmer")
+
+    try:
+        response = server.handle_request(
+            {"id": "list-owner-aware", "method": "session.list", "params": {}}
+        )
+        assert {row["id"] for row in response["result"]["sessions"]} == {
+            "local",
+            "owned-root",
+        }
+    finally:
+        local_db.close()
+        root_db.close()
 
 
 def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):

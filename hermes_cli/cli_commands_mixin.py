@@ -534,6 +534,7 @@ class CLICommandsMixin:
         """
         from cli import _cprint
         from hermes_state import format_session_db_unavailable
+        from hermes_cli.profiles import get_active_profile_name
 
         parts = cmd_original.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
@@ -543,6 +544,7 @@ class CLICommandsMixin:
             return True
 
         platform_name = parts[1].strip().lower()
+        profile_name = get_active_profile_name() or "default"
 
         # Validate platform name + home channel via the live gateway config.
         try:
@@ -620,12 +622,20 @@ class CLICommandsMixin:
             session_title = self.session_id[:8]
 
         # Mark pending — gateway watcher will pick this up.
-        ok = self._session_db.request_handoff(self.session_id, platform_name)
+        ok = self._session_db.request_handoff(
+            self.session_id,
+            platform_name,
+            profile_name=profile_name if profile_name != "default" else None,
+        )
         if not ok:
             _cprint("  Session is already in flight for handoff. Wait for it to settle, then retry.")
             return True
 
-        _cprint(f"  Queued handoff of '{session_title}' → {platform_name} (home: {home.name}).")
+        profile_suffix = f", profile: {profile_name}" if profile_name != "default" else ""
+        _cprint(
+            f"  Queued handoff of '{session_title}' → {platform_name} "
+            f"(home: {home.name}{profile_suffix})."
+        )
         _cprint("  Waiting for the gateway to pick it up...")
 
         # Poll-block on terminal state. Tick every 0.5s; bail at ~60s.
@@ -641,6 +651,8 @@ class CLICommandsMixin:
             if current != last_state:
                 if current == "running":
                     _cprint("  Gateway picked it up; transferring...")
+                elif current == "transferred":
+                    _cprint("  Session ownership transferred; delivering the continuation...")
                 last_state = current
             if current == "completed":
                 _cprint("")
@@ -655,9 +667,63 @@ class CLICommandsMixin:
                 _cprint(f"  Handoff failed: {err}")
                 _cprint("  Your CLI session is intact. Try /handoff again, or /resume on the platform manually.")
                 return True
+            if current == "transferred_with_warning":
+                err = (state_row or {}).get("error") or "delivery did not complete"
+                _cprint(f"  Handoff transferred with a delivery warning: {err}")
+                _cprint(
+                    f"  The gateway copy is canonical. Resume with: "
+                    f"hermes -p {profile_name} --resume {self.session_id}"
+                )
+                self._should_exit = True
+                return False
             _time.sleep(0.5)
 
-        # Timed out. Clear the pending flag so the user can retry.
+        # Timed out. A transferred row is already root-owned and must never be
+        # reactivated locally; exit with an explicit canonical resume command.
+        try:
+            final_state = self._session_db.get_handoff_state(self.session_id) or {}
+        except Exception:
+            final_state = {}
+        if final_state.get("state") in {"transferred", "transferred_with_warning", "completed"}:
+            _cprint("  Timed out waiting for delivery after ownership transferred.")
+            _cprint(
+                f"  Resume the canonical session with: "
+                f"hermes -p {profile_name} --resume {self.session_id}"
+            )
+            self._should_exit = True
+            return False
+
+        # The root-lineage copy is the ownership commit. If both source status
+        # writes failed, the local row can still say pending/running even though
+        # the canonical root already owns this profile's session.
+        root_owned = False
+        if profile_name != "default":
+            try:
+                from hermes_cli.session_resolution import canonical_root_owns_session
+
+                root_owned = canonical_root_owns_session(
+                    self.session_id, active_profile=profile_name
+                )
+            except Exception:
+                root_owned = None
+        if root_owned:
+            _cprint("  Local handoff status is stale; canonical ownership transferred.")
+            _cprint(
+                f"  Resume the canonical session with: "
+                f"hermes -p {profile_name} --resume {self.session_id}"
+            )
+            self._should_exit = True
+            return False
+        if root_owned is None:
+            _cprint("  Canonical ownership is indeterminate; refusing local continuation.")
+            _cprint(
+                f"  Check the canonical session with: "
+                f"hermes -p {profile_name} --resume {self.session_id}"
+            )
+            self._should_exit = True
+            return False
+
+        # Pre-commit timeout keeps the local session authoritative and retryable.
         try:
             self._session_db.fail_handoff(self.session_id, "timed out waiting for gateway")
         except Exception:
@@ -708,7 +774,7 @@ class CLICommandsMixin:
             _cprint(f"  {format_session_db_unavailable()}")
             return
 
-        # Resolve numbered selection, title, or ID
+        # Resolve numbered selection, title, or ID together with its owning DB.
         if target.isdigit():
             sessions = self._list_recent_sessions(limit=10)
             index = int(target)
@@ -717,14 +783,52 @@ class CLICommandsMixin:
                 _cprint("  Use /resume with no arguments to see available sessions.")
                 return
             selected = sessions[index - 1]
-            target_id = selected["id"]
+            lookup_target = selected["id"]
         else:
-            from hermes_cli.main import _resolve_session_by_name_or_id
-            resolved = _resolve_session_by_name_or_id(target)
-            target_id = resolved or target
+            lookup_target = target
 
-        session_meta = self._session_db.get_session(target_id)
+        from hermes_cli.session_resolution import resolve_active_profile_session
+
+        resolved_ref = resolve_active_profile_session(
+            lookup_target,
+            current_db=self._session_db,
+        )
+        if resolved_ref is None:
+            # Compatibility seam for tests/extensions that patch the historical
+            # id-only resolver. Real profile-aware paths resolve above.
+            from hermes_cli.main import _resolve_session_by_name_or_id
+
+            resolved_id = _resolve_session_by_name_or_id(lookup_target)
+            if resolved_id and self._session_db.get_session(resolved_id):
+                target_id = resolved_id
+                target_db = self._session_db
+            else:
+                target_id = lookup_target
+                target_db = self._session_db
+        else:
+            target_id = resolved_ref.session_id
+            target_db = resolved_ref.db
+
+        target_db_owned = bool(
+            resolved_ref is not None and resolved_ref.owns_db
+        )
+
+        try:
+            session_meta = target_db.get_session(target_id)
+        except Exception as exc:
+            if target_db_owned:
+                try:
+                    target_db.close()
+                except Exception:
+                    pass
+            _cprint(f"  Could not load session {target}: {exc}")
+            return
         if not session_meta:
+            if target_db_owned:
+                try:
+                    target_db.close()
+                except Exception:
+                    pass
             _cprint(f"  Session not found: {target}")
             _cprint("  Use /history or `hermes sessions list` to see available sessions.")
             return
@@ -732,7 +836,7 @@ class CLICommandsMixin:
         # If the target is the empty head of a compression chain, redirect to
         # the descendant that actually holds the transcript. See #15000.
         try:
-            resolved_id = self._session_db.resolve_resume_session_id(target_id)
+            resolved_id = target_db.resolve_resume_session_id(target_id)
         except Exception:
             resolved_id = target_id
         if resolved_id and resolved_id != target_id:
@@ -741,15 +845,22 @@ class CLICommandsMixin:
                 f"resuming the descendant with your transcript."
             )
             target_id = resolved_id
-            resolved_meta = self._session_db.get_session(target_id)
+            resolved_meta = target_db.get_session(target_id)
             if resolved_meta:
                 session_meta = resolved_meta
 
-        if target_id == self.session_id:
+        if target_id == self.session_id and target_db is self._session_db:
+            if target_db_owned:
+                try:
+                    target_db.close()
+                except Exception:
+                    pass
             _cprint("  Already on that session.")
             return
 
         old_session_id = self.session_id
+        old_session_db = self._session_db
+        old_session_db_owned = getattr(self, "_session_db_owned", True)
         # Flush un-persisted messages before ending the old session (#47202).
         if self.agent:
             try:
@@ -760,9 +871,20 @@ class CLICommandsMixin:
                 pass
         # End current session
         try:
-            self._session_db.end_session(self.session_id, "resumed_other")
+            old_session_db.end_session(self.session_id, "resumed_other")
         except Exception:
             pass
+
+        if target_db is not old_session_db:
+            self._session_db = target_db
+            self._session_db_owned = target_db_owned
+            if self.agent:
+                self.agent._session_db = target_db
+            if old_session_db_owned:
+                try:
+                    old_session_db.close()
+                except Exception:
+                    pass
 
         # Switch to the target session
         self.session_id = target_id
@@ -771,13 +893,13 @@ class CLICommandsMixin:
         _sync_process_session_id(target_id)
 
         # Load conversation history (strip transcript-only metadata entries)
-        restored = self._session_db.get_messages_as_conversation(target_id)
+        restored = target_db.get_messages_as_conversation(target_id)
         restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
         self.conversation_history = restored
 
         # Re-open the target session so it's not marked as ended
         try:
-            self._session_db.reopen_session(target_id)
+            target_db.reopen_session(target_id)
         except Exception:
             pass
 

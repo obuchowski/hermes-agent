@@ -175,7 +175,17 @@ Use `/handoff <platform>` from a CLI session to transfer the live conversation t
 ```bash
 # Inside a CLI session
 /handoff telegram
+
+# A named profile hands off through that profile's gateway configuration
+hermes -p programmer
+/handoff discord
 ```
+
+For a named profile, the multiplex gateway must be serving that profile. The
+destination adapter and home channel are taken only from the source profile —
+Hermes never falls back to the default profile's Discord, Telegram, or Slack
+configuration. The gateway keeps the same session ID and records the canonical
+continuation under that profile's isolated session namespace.
 
 What happens:
 
@@ -196,13 +206,25 @@ What happens:
 
 6. From that point, the conversation lives on the platform. Reply in the new thread — anyone authorized in that channel shares the same session, and any later real user message in the thread joins seamlessly because thread sessions key without `user_id`.
 
-**Resume back to CLI:** when you want to come back to a desktop, just run `/resume <title>` (or `hermes -r "<title>"` from the shell) and pick up where the platform left off.
+**Resume back to CLI:** when you want to come back to a desktop, run
+`/resume <title>` or `hermes -r "<title>"`. Keep the same profile flag for a
+profile-scoped handoff:
+
+```bash
+hermes -p programmer --resume 20250305_091523_a1b2c3d4
+# --continue/-c and the CLI/TUI resume pickers use the same profile boundary
+```
+
+The CLI and TUI can find the gateway-owned continuation, including its full
+compression lineage and recorded working directory. Other named profiles and
+the default profile cannot list or resume it.
 
 **Failure modes:**
 - No home channel configured → CLI refuses with a `/sethome` hint.
 - Platform not enabled / gateway not running → CLI times out at 60s with a clear message and your CLI session stays intact.
 - Thread creation fails (permissions, topics-mode off) → falls back to the home channel directly and still completes; no thread isolation but the handoff itself works.
-- `adapter.send` fails (rate limit, transient API error) → handoff marked failed with the reason; the row clears so you can retry.
+- Delivery fails before ownership transfer → the profile-local CLI copy stays canonical and can be retried.
+- Delivery fails after ownership transfer → Hermes retries delivery briefly, then exits the stale CLI copy with an explicit profile-aware resume command. The root gateway copy remains canonical, preventing divergent transcripts.
 
 **Limitation worth knowing:** for non-thread-capable platforms with multi-user group home channels, the synthetic turn keys as a DM-style session. This works for self-DM home channels (the typical setup) but isn't ideal for genuinely shared group chats. Threading covers Telegram / Discord / Slack — by far the common case — so most setups never hit this.
 

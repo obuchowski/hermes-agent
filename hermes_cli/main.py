@@ -1296,33 +1296,83 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
       from an exit summary printed before the bug fix, or from notes) get
       resumed at the live tip instead of a stale parent with no messages.
     """
+    resolved = _resolve_session_ref(name_or_id)
+    if resolved is None:
+        return None
     try:
-        from hermes_state import SessionDB
-
-        db = SessionDB()
-
-        # Try as exact session ID first
-        session = db.get_session(name_or_id)
-        resolved_id: Optional[str] = None
-        if session:
-            resolved_id = session["id"]
-        else:
-            # Try as title (with auto-latest for lineage)
-            resolved_id = db.resolve_session_by_title(name_or_id)
-
-        if resolved_id:
-            # Project forward through compression chain so resumes land on
-            # the live tip instead of a dead compressed parent.
+        return resolved.session_id
+    finally:
+        if resolved.owns_db:
             try:
-                resolved_id = db.get_compression_tip(resolved_id) or resolved_id
+                resolved.db.close()
             except Exception:
                 pass
 
-        db.close()
-        return resolved_id
+
+def _resolve_session_ref(name_or_id: str, *, current_db=None):
+    """Resolve a session together with the DB that owns its live transcript."""
+    try:
+        from hermes_cli.session_resolution import resolve_active_profile_session
+
+        return resolve_active_profile_session(name_or_id, current_db=current_db)
     except Exception:
-        pass
-    return None
+        return None
+
+
+def _resolve_most_recent_session_ref(source: str):
+    """Return the newest profile-visible session for ``-c`` without crossing owners."""
+    opened = []
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        from hermes_cli.session_resolution import (
+            merge_profile_session_rows,
+            open_profile_session_dbs,
+            resolve_profile_session,
+        )
+
+        active = get_active_profile_name() or "default"
+        local_db, root_db, opened = open_profile_session_dbs(active_profile=active)
+        rows = merge_profile_session_rows(
+            active_profile=active,
+            local_db=local_db,
+            root_db=root_db,
+            load_rows=lambda db: db.list_sessions_rich(
+                source=source,
+                limit=200,
+                order_by_last_active=True,
+                compact_rows=True,
+            ),
+        )
+        resolved = None
+        if rows:
+            resolved = resolve_profile_session(
+                str(rows[0]["id"]),
+                active_profile=active,
+                local_db=local_db,
+                root_db=root_db,
+            )
+        selected = resolved.db if resolved is not None else None
+        for db in opened:
+            if db is not selected:
+                db.close()
+        if resolved is None:
+            return None
+        from hermes_cli.session_resolution import ResolvedSessionRef
+
+        return ResolvedSessionRef(
+            resolved.session_id,
+            resolved.profile_name,
+            resolved.storage_scope,
+            resolved.db,
+            owns_db=any(db is resolved.db for db in opened),
+        )
+    except Exception:
+        for db in opened:
+            try:
+                db.close()
+            except Exception:
+                pass
+        return None
 
 
 def _read_tui_active_session_file(path: Optional[str]) -> Optional[str]:
@@ -1350,9 +1400,16 @@ def _print_tui_exit_summary(
 
     db = None
     try:
-        from hermes_state import SessionDB
+        resolved = _resolve_session_ref(target)
+        if resolved is not None:
+            db = resolved.db
+            target = resolved.session_id
+        else:
+            # Compatibility for embedded/test callers that provide a custom
+            # SessionDB factory without path-aware construction.
+            from hermes_state import SessionDB
 
-        db = SessionDB()
+            db = SessionDB()
         session = db.get_session(target)
         if not session:
             return
@@ -2258,14 +2315,16 @@ def cmd_chat(args):
 
     _apply_safe_mode(args)
 
+    resolved_session_ref = None
+
     # Resolve --continue into --resume with the latest session or by name
     continue_val = getattr(args, "continue_last", None)
     if continue_val and not getattr(args, "resume", None):
         if isinstance(continue_val, str):
             # -c "session name" — resolve by title or ID
-            resolved = _resolve_session_by_name_or_id(continue_val)
-            if resolved:
-                args.resume = resolved
+            resolved_session_ref = _resolve_session_ref(continue_val)
+            if resolved_session_ref:
+                args.resume = resolved_session_ref.session_id
             else:
                 print(f"No session found matching '{continue_val}'.")
                 print("Use 'hermes sessions list' to see available sessions.")
@@ -2273,22 +2332,35 @@ def cmd_chat(args):
         else:
             # -c with no argument — continue the most recent session
             source = "tui" if use_tui else "cli"
-            last_id = _resolve_last_session(source=source)
-            if not last_id and source == "tui":
-                last_id = _resolve_last_session(source="cli")
-            if last_id:
-                args.resume = last_id
+            resolved_session_ref = _resolve_most_recent_session_ref(source)
+            if not resolved_session_ref and source == "tui":
+                resolved_session_ref = _resolve_most_recent_session_ref("cli")
+            if resolved_session_ref:
+                args.resume = resolved_session_ref.session_id
             else:
-                kind = "TUI" if use_tui else "CLI"
-                print(f"No previous {kind} session found to continue.")
-                sys.exit(1)
+                # Compatibility fallback for callers that replace the legacy
+                # latest-session hook. This path still searches only the
+                # active profile-local DB, so it cannot cross ownership.
+                last_id = _resolve_last_session(source=source)
+                if not last_id and source == "tui":
+                    last_id = _resolve_last_session(source="cli")
+                if last_id:
+                    args.resume = last_id
+                else:
+                    kind = "TUI" if use_tui else "CLI"
+                    print(f"No previous {kind} session found to continue.")
+                    sys.exit(1)
 
     # Resolve --resume by title if it's not a direct session ID
     resume_val = getattr(args, "resume", None)
-    if resume_val:
-        resolved = _resolve_session_by_name_or_id(resume_val)
-        if resolved:
-            args.resume = resolved
+    if resume_val and resolved_session_ref is None:
+        resolved_session_ref = _resolve_session_ref(resume_val)
+        if resolved_session_ref:
+            args.resume = resolved_session_ref.session_id
+        else:
+            legacy_resolved = _resolve_session_by_name_or_id(resume_val)
+            if legacy_resolved:
+                args.resume = legacy_resolved
         # If resolution fails, keep the original value — _init_agent will
         # report "Session not found" with the original input
 
@@ -2302,9 +2374,11 @@ def cmd_chat(args):
         and not getattr(args, "worktree", False)
     ):
         try:
-            from hermes_state import SessionDB
-
-            _saved_cwd = ((SessionDB().get_session(args.resume) or {}).get("cwd") or "").strip()
+            _saved_cwd = (
+                ((resolved_session_ref.db.get_session(args.resume) or {}).get("cwd") or "").strip()
+                if resolved_session_ref is not None
+                else ""
+            )
             if _saved_cwd and not os.path.isdir(_saved_cwd):
                 print(f"⚠ session's recorded dir is gone ({_saved_cwd}); staying in {os.getcwd()}")
             elif _saved_cwd and os.path.realpath(_saved_cwd) != os.path.realpath(os.getcwd()):
@@ -2414,6 +2488,11 @@ def cmd_chat(args):
     _pin_kanban_board_env()
 
     if use_tui:
+        if resolved_session_ref is not None:
+            try:
+                resolved_session_ref.db.close()
+            except Exception:
+                pass
         _launch_tui(
             getattr(args, "resume", None),
             tui_dev=getattr(args, "tui_dev", False),
@@ -2453,6 +2532,9 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
+        "session_db": (
+            resolved_session_ref.db if resolved_session_ref is not None else None
+        ),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}

@@ -3676,6 +3676,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        session_db: Any = None,
     ):
         """
         Initialize the Hermes CLI.
@@ -3954,11 +3955,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._prompt_duration: float = 0.0  # frozen duration of last completed turn
         self._last_turn_finished_at: Optional[float] = None  # time.time() when the last agent loop finished
         # Initialize SQLite session store early so /title works before first message
-        self._session_db = None
+        self._session_db = session_db
         self._session_db_unavailable = False
         try:
             from hermes_state import SessionDB
-            self._session_db = SessionDB()
+            if self._session_db is None:
+                self._session_db = SessionDB()
         except Exception as e:
             # #41386: a failed session store means the transcript is NOT
             # persisted to state.db — the live chat looks healthy but resume
@@ -6785,17 +6787,52 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if not self._session_db:
             return []
         try:
+            from pathlib import Path
+            from hermes_cli.profiles import get_active_profile_name
             from hermes_cli.session_listing import query_session_listing
-
-            return query_session_listing(
-                self._session_db,
-                source="cli",
-                current_session_id=self.session_id,
-                include_all_sources=False,
-                include_unnamed=True,
-                limit=limit,
-                exclude_sources=["tool"],
+            from hermes_cli.session_resolution import (
+                merge_profile_session_rows,
+                open_profile_session_dbs,
             )
+
+            # Lightweight test/custom DB doubles do not expose a filesystem
+            # identity. Preserve the historical one-store path for them.
+            if not isinstance(getattr(self._session_db, "db_path", None), (str, Path)):
+                return query_session_listing(
+                    self._session_db,
+                    source="cli",
+                    current_session_id=self.session_id,
+                    include_all_sources=False,
+                    include_unnamed=True,
+                    limit=limit,
+                    exclude_sources=["tool"],
+                )
+
+            active_profile = get_active_profile_name() or "default"
+            local_db, root_db, opened = open_profile_session_dbs(
+                active_profile=active_profile,
+                current_db=self._session_db,
+            )
+            try:
+                rows = merge_profile_session_rows(
+                    active_profile=active_profile,
+                    local_db=local_db,
+                    root_db=root_db,
+                    load_rows=lambda db: query_session_listing(
+                        db,
+                        source="cli",
+                        current_session_id=self.session_id,
+                        include_all_sources=True,
+                        include_unnamed=True,
+                        limit=max(limit * 2, 20),
+                        exclude_sources=["tool"],
+                    ),
+                )
+                return rows[:limit]
+            finally:
+                for db in opened:
+                    if db is not self._session_db:
+                        db.close()
         except Exception:
             return []
 
@@ -15965,6 +16002,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    session_db: Any = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -16100,6 +16138,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        session_db=session_db,
     )
 
     if parsed_skills:

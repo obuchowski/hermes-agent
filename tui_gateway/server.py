@@ -452,6 +452,18 @@ def _release_active_session_slot(session: dict | None) -> None:
         logger.debug("Failed to release active session slot", exc_info=True)
 
 
+def _close_owned_session_db(session: dict | None) -> None:
+    """Close and detach a session-pinned DB iff this record owns it."""
+    if not session or not session.pop("session_db_owned", False):
+        return
+    db = session.pop("session_db", None)
+    if db is not None:
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Failed to close session-owned DB", exc_info=True)
+
+
 def _transfer_active_session_slot(
     sid: str,
     session: dict,
@@ -625,8 +637,9 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     _tui_owns_lifecycle = True
     if session_id:
         try:
-            db = _get_db()
-            if db is not None:
+            with _session_db(session) as db:
+                if db is None:
+                    raise RuntimeError("session database unavailable")
                 # Don't end gateway-originated sessions — the gateway owns
                 # their lifecycle.  The TUI is a viewer, not the owner.
                 # Ending a gateway session in state.db triggers a Groundhog
@@ -712,6 +725,7 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
             agent.close()
     except Exception:
         pass
+    _close_owned_session_db(session)
     # NOTE: the slash-worker is closed inside _finalize_session (the single
     # _finalized-guarded chokepoint that main folded it into), exactly once.
     # We deliberately do NOT re-close it here — _teardown_session's job beyond
@@ -1525,15 +1539,18 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Build against the session's profile (global-remote): bind its
             # HERMES_HOME so config/skills/model resolve to it, and hand the
             # agent that profile's db so turns persist to the right state.db.
-            session_db = None
+            session_db = current.get("session_db")
             if profile_home:
                 home_token = set_hermes_home_override(profile_home)
-                try:
-                    from hermes_state import SessionDB
+                if session_db is None:
+                    try:
+                        from hermes_state import SessionDB
 
-                    session_db = SessionDB(db_path=Path(profile_home) / "state.db")
-                except Exception:
-                    session_db = None
+                        session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                        current["session_db"] = session_db
+                        current["session_db_owned"] = True
+                    except Exception:
+                        session_db = None
             try:
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
@@ -1636,6 +1653,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
             current["agent_error"] = str(e)
+            _close_owned_session_db(current)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
             if home_token is not None:
@@ -1645,13 +1663,15 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # leak (session.close unregistered before _build registered it).
             with _sessions_lock:
                 replaced = _sessions.get(sid) is not current
-            if replaced and notify_registered:
-                try:
-                    from tools.approval import unregister_gateway_notify
+            if replaced:
+                _close_owned_session_db(current)
+                if notify_registered:
+                    try:
+                        from tools.approval import unregister_gateway_notify
 
-                    unregister_gateway_notify(key)
-                except Exception:
-                    pass
+                        unregister_gateway_notify(key)
+                    except Exception:
+                        pass
             ready.set()
 
     threading.Thread(target=_build, daemon=True).start()
@@ -1997,11 +2017,17 @@ def _persist_branch_seed(session: dict) -> None:
 def _session_db(session: dict):
     """Yield the SessionDB that owns this session's row (profile-aware).
 
-    Mirrors :func:`_ensure_session_db_row`: a remote/profile session persists
-    into its own profile's ``state.db`` (a fresh handle we close on exit);
-    everything else borrows the shared ``_get_db()`` handle (left open). Yields
-    None when the db is unavailable.
+    A resumed session may pin its canonical owner DB (including the gateway
+    root DB for a transferred profile session); that long-lived handle is
+    closed by session teardown. Otherwise a remote/profile session opens its
+    profile-local DB for this operation and closes it on exit, while launch-
+    profile sessions borrow the shared ``_get_db()`` handle. Yields None when
+    the DB is unavailable.
     """
+    pinned = session.get("session_db")
+    if pinned is not None:
+        yield pinned
+        return
     db, close_db = None, False
     profile_home = session.get("profile_home")
     if profile_home:
@@ -5654,10 +5680,26 @@ def _(rid, params: dict) -> dict:
 
 @method("session.list")
 def _(rid, params: dict) -> dict:
-    db = _get_db()
+    profile = (params.get("profile") or "").strip() or None
+    profile_home = _profile_home(profile)
+    close_local = False
+    if profile_home is not None:
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=profile_home / "state.db")
+        close_local = True
+        active_profile = profile or _current_profile_name()
+    else:
+        db = _get_db()
+        active_profile = profile or _current_profile_name()
     if db is None:
         return _db_unavailable_error(rid, code=5006)
     try:
+        from hermes_cli.session_resolution import (
+            merge_profile_session_rows,
+            open_profile_session_dbs,
+        )
+
         # Resume picker should surface human conversation sessions from every
         # user-facing surface — CLI, TUI, all gateway platforms (including new
         # ones not enumerated here), ACP adapter clients, webhook sessions,
@@ -5673,11 +5715,57 @@ def _(rid, params: dict) -> dict:
         # short; the compression-tip projection in ``list_sessions_rich``
         # can also merge rows.
         fetch_limit = max(limit * 2, 200)
-        rows = [
-            s
-            for s in db.list_sessions_rich(source=None, limit=fetch_limit, order_by_last_active=True, compact_rows=True)
-            if (s.get("source") or "").strip().lower() not in deny
-        ][:limit]
+        if not isinstance(getattr(db, "db_path", None), (str, Path)):
+            rows = [
+                s
+                for s in db.list_sessions_rich(
+                    source=None,
+                    limit=fetch_limit,
+                    order_by_last_active=True,
+                    compact_rows=True,
+                )
+                if (s.get("source") or "").strip().lower() not in deny
+            ][:limit]
+            return _ok(
+                rid,
+                {
+                    "sessions": [
+                        {
+                            "id": s["id"],
+                            "title": s.get("title") or "",
+                            "preview": s.get("preview") or "",
+                            "started_at": s.get("started_at") or 0,
+                            "message_count": s.get("message_count") or 0,
+                            "source": s.get("source") or "",
+                        }
+                        for s in rows
+                    ]
+                },
+            )
+        local_db, root_db, opened = open_profile_session_dbs(
+            active_profile=active_profile,
+            current_db=db,
+        )
+        try:
+            rows = merge_profile_session_rows(
+                active_profile=active_profile,
+                local_db=local_db,
+                root_db=root_db,
+                load_rows=lambda owner_db: [
+                    s
+                    for s in owner_db.list_sessions_rich(
+                        source=None,
+                        limit=fetch_limit,
+                        order_by_last_active=True,
+                        compact_rows=True,
+                    )
+                    if (s.get("source") or "").strip().lower() not in deny
+                ],
+            )[:limit]
+        finally:
+            for opened_db in opened:
+                if opened_db is not db:
+                    opened_db.close()
         return _ok(
             rid,
             {
@@ -5696,6 +5784,11 @@ def _(rid, params: dict) -> dict:
         )
     except Exception as e:
         return _err(rid, 5006, str(e))
+    finally:
+        if close_local:
+            close = getattr(db, "close", None)
+            if callable(close):
+                close()
 
 
 @method("session.most_recent")
@@ -5713,16 +5806,59 @@ def _(rid, params: dict) -> dict:
     null-result shape (and logged) so callers don't have to special-
     case JSON-RPC error envelopes for what is a normal "no answer".
     """
-    db = _get_db()
+    profile = (params.get("profile") or "").strip() or None
+    profile_home = _profile_home(profile)
+    close_local = False
+    if profile_home is not None:
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=profile_home / "state.db")
+        close_local = True
+        active_profile = profile or _current_profile_name()
+    else:
+        db = _get_db()
+        active_profile = profile or _current_profile_name()
     if db is None:
         return _ok(rid, {"session_id": None})
     try:
+        from hermes_cli.session_resolution import (
+            merge_profile_session_rows,
+            open_profile_session_dbs,
+        )
+
         deny = frozenset({"tool"})
         # Over-fetch by a generous bounded amount so heavy sub-agent
         # users (lots of recent ``tool`` rows) don't get a false
         # "no eligible session" answer.  ``session.list`` uses a
         # similar over-fetch strategy.
-        rows = db.list_sessions_rich(source=None, limit=200, order_by_last_active=True, compact_rows=True)
+        if not isinstance(getattr(db, "db_path", None), (str, Path)):
+            rows = db.list_sessions_rich(
+                source=None,
+                limit=200,
+                order_by_last_active=True,
+                compact_rows=True,
+            )
+        else:
+            local_db, root_db, opened = open_profile_session_dbs(
+                active_profile=active_profile,
+                current_db=db,
+            )
+            try:
+                rows = merge_profile_session_rows(
+                    active_profile=active_profile,
+                    local_db=local_db,
+                    root_db=root_db,
+                    load_rows=lambda owner_db: owner_db.list_sessions_rich(
+                        source=None,
+                        limit=200,
+                        order_by_last_active=True,
+                        compact_rows=True,
+                    ),
+                )
+            finally:
+                for opened_db in opened:
+                    if opened_db is not db:
+                        opened_db.close()
         for row in rows:
             src = (row.get("source") or "").strip().lower()
             if src in deny:
@@ -5740,6 +5876,11 @@ def _(rid, params: dict) -> dict:
     except Exception:
         logger.exception("session.most_recent failed")
         return _ok(rid, {"session_id": None})
+    finally:
+        if close_local:
+            close = getattr(db, "close", None)
+            if callable(close):
+                close()
 
 
 @method("project.facts")
@@ -5813,9 +5954,12 @@ def _deferred_session_record(
     close_on_disconnect: bool = False,
     display_history_prefix: list | None = None,
     profile_home: Path | None = None,
+    profile_name: str | None = None,
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    session_db=None,
+    session_db_owned: bool = False,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -5843,10 +5987,13 @@ def _deferred_session_record(
         "model_override": model_override,
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
+        "profile_name": profile_name,
         "resume_runtime_overrides": resume_runtime_overrides,
         "resume_session_id": session_key,
         "running": False,
         "session_key": session_key,
+        "session_db": session_db,
+        "session_db_owned": session_db_owned,
         "show_reasoning": _load_show_reasoning(),
         "slash_worker": None,
         "source": source,
@@ -5867,6 +6014,7 @@ def _claim_or_reuse_live(
         if live is not None:
             if lease is not None:
                 lease.release()
+            _close_owned_session_db(record)
             return live
         with _sessions_lock:
             _sessions[sid] = record
@@ -5908,12 +6056,40 @@ def _(rid, params: dict) -> dict:
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=profile_home / "state.db")
+        db_owned = True
     else:
         db = _get_db()
+        db_owned = False
     if db is None:
         return _db_unavailable_error(rid, code=5000)
 
-    found = db.get_session(target)
+    initial_db = db
+    active_profile = profile or _current_profile_name()
+    from hermes_cli.session_resolution import resolve_active_profile_session
+
+    try:
+        resolved_ref = resolve_active_profile_session(
+            target,
+            active_profile=active_profile,
+            current_db=db,
+        )
+        if resolved_ref is not None:
+            db = resolved_ref.db
+            if profile_home is not None and initial_db is not db:
+                close = getattr(initial_db, "close", None)
+                if callable(close):
+                    close()
+                db_owned = resolved_ref.owns_db
+            elif db is not initial_db:
+                db_owned = resolved_ref.owns_db
+            target = resolved_ref.session_id
+            found = db.get_session(target)
+        else:
+            found = db.get_session(target)
+    except Exception as exc:
+        if db_owned:
+            db.close()
+        return _err(rid, 5000, f"resume failed: {exc}")
     if not found:
         found = db.get_session_by_title(target)
         if found:
@@ -5932,6 +6108,8 @@ def _(rid, params: dict) -> dict:
             # streams the whole turn anyway and the row exists by upgrade time.
             found = {}
         else:
+            if db_owned:
+                db.close()
             return _err(rid, 4007, "session not found")
 
     # Follow the compression-continuation chain to the live tip so a resume on
@@ -5979,6 +6157,8 @@ def _(rid, params: dict) -> dict:
     with _session_resume_lock:
         live = _find_live_session_by_key(target)
         if live is not None:
+            if db_owned:
+                db.close()
             return _ok(rid, _reuse_live_payload(*live))
 
     # Lazy/watch resume: register the live session WITHOUT building an agent.
@@ -5995,6 +6175,8 @@ def _(rid, params: dict) -> dict:
             target, live_session_id=sid, surface=source
         )
         if limit_message is not None:
+            if db_owned:
+                db.close()
             return _err(rid, 4090, limit_message)
         try:
             db.reopen_session(target)
@@ -6004,6 +6186,8 @@ def _(rid, params: dict) -> dict:
         except Exception as e:
             if lease is not None:
                 lease.release()
+            if db_owned:
+                db.close()
             return _err(rid, 5000, f"resume failed: {e}")
         cwd = profile_resume_cwd or _default_session_cwd()
         record = _deferred_session_record(
@@ -6015,7 +6199,10 @@ def _(rid, params: dict) -> dict:
             source=source,
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             profile_home=profile_home,
+            profile_name=active_profile,
             lazy=True,
+            session_db=db,
+            session_db_owned=db_owned,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
@@ -6059,6 +6246,8 @@ def _(rid, params: dict) -> dict:
             target, live_session_id=sid, surface=source
         )
         if limit_message is not None:
+            if db_owned:
+                db.close()
             return _err(rid, 4090, limit_message)
         # Interactive resume routes approvals/clarify through gateway prompts;
         # the deferred build wires the remaining per-session callbacks.
@@ -6070,6 +6259,8 @@ def _(rid, params: dict) -> dict:
         except Exception as e:
             if lease is not None:
                 lease.release()
+            if db_owned:
+                db.close()
             return _err(rid, 5000, f"resume failed: {e}")
         # Display keeps the full transcript; the model-fed history drops a
         # dangling/interrupted tool-call tail so a session killed mid-loop does
@@ -6092,8 +6283,11 @@ def _(rid, params: dict) -> dict:
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             display_history_prefix=prefix,
             profile_home=profile_home,
+            profile_name=active_profile,
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
+            session_db=db,
+            session_db_owned=db_owned,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
@@ -6132,6 +6326,8 @@ def _(rid, params: dict) -> dict:
         target, live_session_id=sid, surface=source
     )
     if limit_message is not None:
+        if db_owned:
+            db.close()
         return _err(rid, 4090, limit_message)
     _enable_gateway_prompts()
     home_token = (
@@ -6176,6 +6372,8 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         if lease is not None:
             lease.release()
+        if db_owned:
+            db.close()
         return _err(rid, 5000, f"resume failed: {e}")
     finally:
         if home_token is not None:
@@ -6194,6 +6392,8 @@ def _(rid, params: dict) -> dict:
                 pass
             if lease is not None:
                 lease.release()
+            if db_owned:
+                db.close()
             other_sid, other_session = live
             payload = _live_session_payload(
                 other_sid,
@@ -6235,10 +6435,15 @@ def _(rid, params: dict) -> dict:
                 # skills — must resolve to the resumed profile too).
                 if profile_home is not None:
                     _sessions[sid]["profile_home"] = str(profile_home)
+                _sessions[sid]["profile_name"] = active_profile
+                _sessions[sid]["session_db"] = db
+                _sessions[sid]["session_db_owned"] = db_owned
                 _sessions[sid]["active_session_lease"] = lease
         except Exception as e:
             if lease is not None:
                 lease.release()
+            if db_owned:
+                db.close()
             return _err(rid, 5000, f"resume failed: {e}")
         session = _sessions.get(sid) or {}
     return _ok(
@@ -6773,9 +6978,10 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """Poll the handoff state for a session.
 
-    Returns ``{state, platform, error}`` where ``state`` is one of
-    ``pending|running|completed|failed`` (or empty when no handoff record
-    exists). Desktop polls this after ``handoff.request``.
+    Returns ``{state, platform, error}``. ``transferred`` is an in-progress
+    post-commit state. A terminal ``transferred_with_warning`` is presented as
+    ``completed`` to older desktop clients so they close the stale local owner
+    instead of timing out and continuing a divergent transcript.
     """
     session, err = _sess_nowait(params, rid)
     if err:
@@ -6786,10 +6992,31 @@ def _(rid, params: dict) -> dict:
         record = db.get_handoff_state(session["session_key"])
 
     record = record or {}
+    state = record.get("state") or ""
+    if state == "transferred_with_warning":
+        state = "completed"
+    elif state in {"", "pending", "running"}:
+        profile_name = str(
+            session.get("profile_name") or _current_profile_name() or "default"
+        )
+        if profile_name != "default":
+            try:
+                from hermes_cli.session_resolution import canonical_root_owns_session
+
+                if canonical_root_owns_session(
+                    session["session_key"], active_profile=profile_name
+                ):
+                    state = "completed"
+                    record["error"] = (
+                        "Local handoff status is stale; the canonical root owns "
+                        f"this session. Resume canonical session {session['session_key']}."
+                    )
+            except Exception:
+                logger.debug("canonical handoff ownership check failed", exc_info=True)
     return _ok(
         rid,
         {
-            "state": record.get("state") or "",
+            "state": state,
             "platform": record.get("platform") or "",
             "error": record.get("error") or "",
         },
