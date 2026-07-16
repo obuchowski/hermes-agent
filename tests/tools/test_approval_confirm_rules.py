@@ -104,6 +104,33 @@ def test_default_confirm_rules_are_empty():
     assert DEFAULT_CONFIG["approvals"]["confirm"] == []
 
 
+def test_executable_confirm_guard_returns_none_for_nonmatch(confirm_config):
+    result = approval.check_executable_confirm_guard("echo aws")
+
+    assert result is None
+
+
+def test_executable_confirm_guard_runs_one_shot_gate(
+    confirm_config, monkeypatch
+):
+    _interactive(monkeypatch)
+    calls = []
+
+    def approve_once(command, description, **kwargs):
+        calls.append((command, description, kwargs))
+        return "once"
+
+    result = approval.check_executable_confirm_guard(
+        "aws sts get-caller-identity",
+        approval_callback=approve_once,
+    )
+
+    assert result["approved"] is True
+    assert result["executable_confirm"] is True
+    assert result["user_approved"] is True
+    assert calls[0][2]["allow_permanent"] is False
+
+
 @pytest.mark.parametrize(
     "command",
     [
