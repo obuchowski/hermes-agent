@@ -600,7 +600,9 @@ class SessionPortabilityMixin:
             clean_messages.append(self._normalize_import_message(message, message_index))
         return {"session": clean_session, "messages": clean_messages}
 
-    def _validate_import_payload(self, sessions: List[Dict[str, Any]]) -> tuple:
+    def _validate_import_payload(
+        self, sessions: List[Dict[str, Any]], *, trusted_profile_transfer: bool = False
+    ) -> tuple:
         """Size/shape/type validation of the whole payload; returns ``(normalized_items,
         errors)``. Every rejected entry is reported."""
         normalized: List[Dict[str, Any]] = []
@@ -610,7 +612,13 @@ class SessionPortabilityMixin:
         for index, raw in enumerate(sessions):
             session_id = str(raw.get("id") or "").strip() if isinstance(raw, dict) else ""
             try:
-                item = self._validate_import_session(raw, session_id, seen_ids, totals)
+                item = self._validate_import_session(
+                    raw,
+                    session_id,
+                    seen_ids,
+                    totals,
+                    trusted_profile_transfer=trusted_profile_transfer,
+                )
             except ValueError as exc:
                 item = {"index": index, "error": str(exc)}
                 if session_id:
@@ -621,7 +629,15 @@ class SessionPortabilityMixin:
             normalized.append({"index": index, **item})
         return normalized, errors
 
-    def _validate_import_session(self, raw: Any, session_id: str, seen_ids: set, totals: Dict[str, int]) -> Dict[str, Any]:
+    def _validate_import_session(
+        self,
+        raw: Any,
+        session_id: str,
+        seen_ids: set,
+        totals: Dict[str, int],
+        *,
+        trusted_profile_transfer: bool = False,
+    ) -> Dict[str, Any]:
         """One payload session -> normalized item; ValueError(message) on rejection. *totals*
         accumulate before their limit check (a rejected oversize entry still counts)."""
         if not isinstance(raw, dict):
@@ -644,7 +660,7 @@ class SessionPortabilityMixin:
             session_bytes = len(json.dumps(measured, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         except (TypeError, ValueError):
             raise ValueError("session must be JSON serializable") from None
-        if session_bytes > self._IMPORT_MAX_SESSION_BYTES:
+        if not trusted_profile_transfer and session_bytes > self._IMPORT_MAX_SESSION_BYTES:
             raise ValueError("session exceeds the import size limit")
         totals["bytes"] += session_bytes
         if totals["bytes"] > self._IMPORT_MAX_TOTAL_BYTES:
@@ -754,7 +770,9 @@ class SessionPortabilityMixin:
             )
             payload.append(segment)
 
-        normalized, errors = self._validate_import_payload(payload)
+        normalized, errors = self._validate_import_payload(
+            payload, trusted_profile_transfer=True
+        )
         if errors:
             return {"ok": False, "imported": 0, "skipped": 0, "detached": 0, "errors": errors}
 

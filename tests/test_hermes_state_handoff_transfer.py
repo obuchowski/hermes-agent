@@ -80,6 +80,31 @@ def test_transfer_session_lineage_allows_identical_existing_replay(db, tmp_path)
         target.close()
 
 
+def test_transfer_session_lineage_accepts_large_trusted_local_session(db, tmp_path):
+    db.create_session("large-handoff", "cli", profile_name="programmer")
+    large_content = "x" * (SessionDB._IMPORT_MAX_SESSION_BYTES + 1)
+    db.append_message("large-handoff", role="user", content=large_content)
+    db._conn.execute(
+        "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ?",
+        ("large-handoff",),
+    )
+    db._conn.commit()
+
+    target = SessionDB(db_path=tmp_path / "gateway_state.db")
+    try:
+        result = target.transfer_session_lineage_from(
+            db, "large-handoff", profile_name="programmer"
+        )
+        assert result["transferred_ids"] == ["large-handoff"]
+        messages = target.get_messages("large-handoff", include_inactive=True)
+        assert len(messages) == 1
+        assert messages[0]["content"] == large_content
+        assert messages[0]["active"] == 0
+        assert messages[0]["compacted"] == 1
+    finally:
+        target.close()
+
+
 def test_transfer_session_lineage_collision_aborts_before_mutation(db, tmp_path):
     db.create_session("parent", "cli", profile_name="programmer")
     db.append_message("parent", role="user", content="source parent")
