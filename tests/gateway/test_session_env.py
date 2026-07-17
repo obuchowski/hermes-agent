@@ -1,5 +1,8 @@
 import asyncio
 import os
+import threading
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -12,6 +15,7 @@ from gateway.session_context import (
     clear_session_vars,
     _VAR_MAP,
     _UNSET,
+    restore_session_workspace,
 )
 
 
@@ -244,6 +248,259 @@ def test_set_session_env_includes_session_key():
     assert get_session_env("HERMES_SESSION_KEY") != "tg:-1001:17585"
 
 
+def test_handed_off_session_row_restores_cwd_and_raw_session_id(tmp_path, monkeypatch):
+    """A gateway binding carries the durable row's cwd and raw DB id."""
+    from agent.runtime_cwd import resolve_context_cwd
+    from tools.terminal_tool import get_session_cwd
+
+    process_cwd = tmp_path / "gateway-default"
+    workspace = tmp_path / "workspace"
+    process_cwd.mkdir()
+    workspace.mkdir()
+    monkeypatch.chdir(process_cwd)
+
+    context = SessionContext(
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan",
+            chat_type="channel",
+        ),
+        connected_platforms=[],
+        home_channels={},
+        session_key="agent:main:discord:channel:chan",
+        session_id="handoff-session",
+    )
+    assert restore_session_workspace(
+        context, {"id": "handoff-session", "cwd": str(workspace)}
+    ) == str(workspace)
+
+    runner = object.__new__(GatewayRunner)
+    tokens = runner._set_session_env(context)
+    try:
+        assert get_session_env("HERMES_SESSION_ID") == "handoff-session"
+        assert resolve_context_cwd() == workspace
+        assert get_session_cwd("handoff-session") == str(workspace)
+    finally:
+        runner._clear_session_env(tokens)
+        from tools.terminal_tool import clear_task_env_overrides
+
+        clear_task_env_overrides("handoff-session")
+
+
+@pytest.mark.asyncio
+async def test_gateway_queries_raw_durable_session_id_before_binding(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    context = SessionContext(
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan",
+            chat_type="channel",
+        ),
+        connected_platforms=[],
+        home_channels={},
+        session_key="agent:main:discord:channel:chan",
+        session_id="raw-handoff-id",
+    )
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = type("AsyncDB", (), {})()
+    runner._session_db.get_session = AsyncMock(
+        return_value={"id": "raw-handoff-id", "cwd": str(workspace)}
+    )
+
+    try:
+        assert await runner._restore_session_workspace(context) == str(workspace)
+        runner._session_db.get_session.assert_awaited_once_with("raw-handoff-id")
+        assert context.cwd == str(workspace)
+    finally:
+        runner._shutdown_executor()
+
+
+@pytest.mark.asyncio
+async def test_gateway_workspace_validation_runs_off_event_loop(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    context = SessionContext(
+        source=SessionSource(platform=Platform.DISCORD, chat_id="chan"),
+        connected_platforms=[],
+        home_channels={},
+        session_id="off-loop-session",
+    )
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = type("AsyncDB", (), {})()
+    runner._session_db.get_session = AsyncMock(
+        return_value={"id": "off-loop-session", "cwd": str(workspace)}
+    )
+    loop_thread = threading.get_ident()
+    validation_threads = []
+    real_is_dir = Path.is_dir
+
+    def recording_is_dir(path):
+        validation_threads.append(threading.get_ident())
+        return real_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", recording_is_dir)
+    try:
+        assert await runner._restore_session_workspace(context) == str(workspace)
+        assert validation_threads
+        assert validation_threads[0] != loop_thread
+    finally:
+        runner._shutdown_executor()
+
+
+@pytest.mark.asyncio
+async def test_gateway_workspace_lookup_error_preserves_known_good_state(tmp_path):
+    from tools.terminal_tool import (
+        clear_task_env_overrides,
+        get_session_cwd,
+        register_task_env_overrides,
+    )
+
+    session_id = "lookup-error-session"
+    known_good = tmp_path / "known-good"
+    known_good.mkdir()
+    context = SessionContext(
+        source=SessionSource(platform=Platform.DISCORD, chat_id="chan"),
+        connected_platforms=[],
+        home_channels={},
+        session_id=session_id,
+    )
+    setattr(context, "cwd", str(known_good))
+    register_task_env_overrides(session_id, {"cwd": str(known_good)})
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = type("AsyncDB", (), {})()
+    runner._session_db.get_session = AsyncMock(
+        side_effect=RuntimeError("sqlite temporarily unavailable")
+    )
+    prompt_built = False
+
+    try:
+        with pytest.raises(RuntimeError, match="sqlite temporarily unavailable"):
+            await runner._restore_session_workspace(context)
+            prompt_built = True
+        assert prompt_built is False
+        assert context.cwd == str(known_good)
+        assert get_session_cwd(session_id) == str(known_good)
+    finally:
+        clear_task_env_overrides(session_id)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_gateway_session_cwds_do_not_cross_talk(tmp_path):
+    """Task-local cwd and raw session ids remain isolated under concurrency."""
+    from agent.runtime_cwd import resolve_context_cwd
+    from tools.terminal_tool import get_session_cwd
+
+    workspaces = [tmp_path / "alpha", tmp_path / "beta"]
+    for workspace in workspaces:
+        workspace.mkdir()
+
+    async def observe(name: str, workspace):
+        context = SessionContext(
+            source=SessionSource(
+                platform=Platform.DISCORD,
+                chat_id=name,
+                chat_type="channel",
+            ),
+            connected_platforms=[],
+            home_channels={},
+            session_key=f"route-{name}",
+            session_id=f"raw-{name}",
+        )
+        restore_session_workspace(
+            context, {"id": f"raw-{name}", "cwd": str(workspace)}
+        )
+        runner = object.__new__(GatewayRunner)
+        tokens = runner._set_session_env(context)
+        try:
+            await asyncio.sleep(0)
+            return (
+                get_session_env("HERMES_SESSION_ID"),
+                resolve_context_cwd(),
+                get_session_cwd(f"raw-{name}"),
+            )
+        finally:
+            runner._clear_session_env(tokens)
+            from tools.terminal_tool import clear_task_env_overrides
+
+            clear_task_env_overrides(f"raw-{name}")
+
+    alpha, beta = await asyncio.gather(
+        observe("alpha", workspaces[0]), observe("beta", workspaces[1])
+    )
+    assert alpha == ("raw-alpha", workspaces[0], str(workspaces[0]))
+    assert beta == ("raw-beta", workspaces[1], str(workspaces[1]))
+
+
+def test_gateway_prompt_build_uses_handed_off_workspace(tmp_path, monkeypatch):
+    """Project instructions come from the session row, not gateway getcwd()."""
+    from agent.prompt_builder import build_context_files_prompt
+    from agent.runtime_cwd import resolve_context_cwd
+
+    process_cwd = tmp_path / "gateway-default"
+    workspace = tmp_path / "handed-off"
+    process_cwd.mkdir()
+    workspace.mkdir()
+    (process_cwd / "AGENTS.md").write_text("WRONG PROCESS WORKSPACE")
+    (workspace / "AGENTS.md").write_text("HANDED OFF WORKSPACE RULE")
+    monkeypatch.chdir(process_cwd)
+
+    context = SessionContext(
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan",
+            chat_type="channel",
+        ),
+        connected_platforms=[], home_channels={}, session_id="prompt-session",
+    )
+    restore_session_workspace(
+        context, {"id": "prompt-session", "cwd": str(workspace)}
+    )
+    runner = object.__new__(GatewayRunner)
+    tokens = runner._set_session_env(context)
+    try:
+        prompt = build_context_files_prompt(
+            cwd=resolve_context_cwd(), skip_soul=True
+        )
+    finally:
+        runner._clear_session_env(tokens)
+        from tools.terminal_tool import clear_task_env_overrides
+
+        clear_task_env_overrides("prompt-session")
+
+    assert "HANDED OFF WORKSPACE RULE" in prompt
+    assert "WRONG PROCESS WORKSPACE" not in prompt
+
+
+def test_invalid_handed_off_cwd_falls_back_without_stale_task_state(tmp_path):
+    from agent.runtime_cwd import resolve_context_cwd
+    from tools.terminal_tool import get_session_cwd, register_task_env_overrides
+
+    session_id = "invalid-cwd-session"
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    register_task_env_overrides(session_id, {"cwd": str(stale)})
+    context = SessionContext(
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan",
+            chat_type="channel",
+        ),
+        connected_platforms=[], home_channels={}, session_id=session_id,
+    )
+    assert restore_session_workspace(
+        context, {"id": session_id, "cwd": str(tmp_path / "missing")}
+    ) == ""
+
+    runner = object.__new__(GatewayRunner)
+    tokens = runner._set_session_env(context)
+    try:
+        assert resolve_context_cwd() is None
+        assert get_session_cwd(session_id) is None
+    finally:
+        runner._clear_session_env(tokens)
+
+
 def test_session_key_no_race_condition_with_contextvars(monkeypatch):
     """Prove contextvars isolates SESSION_KEY across concurrent async tasks.
 
@@ -393,4 +650,3 @@ async def test_gateway_executor_refuses_resurrection_after_shutdown():
             await runner._run_in_executor_with_context(lambda: "second")
     finally:
         runner._shutdown_executor()
-

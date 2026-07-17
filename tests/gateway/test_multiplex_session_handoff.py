@@ -67,6 +67,30 @@ def test_handoff_sources_include_each_served_profile_db(multiplex_homes):
         root_db.close()
 
 
+def test_handoff_lineage_transfer_preserves_session_cwd(tmp_path):
+    source_db = SessionDB(db_path=tmp_path / "source.db")
+    gateway_db = SessionDB(db_path=tmp_path / "gateway.db")
+    workspace = tmp_path / "cli-workspace"
+    workspace.mkdir()
+    source_db.create_session(
+        "handoff-cwd",
+        "cli",
+        profile_name="programmer",
+        cwd=str(workspace),
+    )
+    try:
+        result = gateway_db.transfer_session_lineage_from(
+            source_db,
+            "handoff-cwd",
+            profile_name="programmer",
+        )
+        assert result["ok"] is True
+        assert gateway_db.get_session("handoff-cwd")["cwd"] == str(workspace)
+    finally:
+        gateway_db.close()
+        source_db.close()
+
+
 @pytest.mark.asyncio
 async def test_named_profile_handoff_transfers_lineage_and_uses_profile_discord(
     multiplex_homes, monkeypatch

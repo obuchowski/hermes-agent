@@ -37,6 +37,7 @@ needs to replace the import + call site:
 """
 
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -211,7 +212,78 @@ def set_session_vars(
         set_session_cwd(cwd)
     except Exception:
         pass
+    # Terminal, file, and execute_code resolution is keyed by the durable raw
+    # session id (not the gateway routing key).  Seed the existing task-cwd
+    # registry at the same boundary where the ContextVar is bound so every tool
+    # surface observes the same handed-off workspace before its first call.
+    if session_id and cwd:
+        try:
+            from tools.terminal_tool import register_task_env_overrides
+
+            register_task_env_overrides(session_id, {"cwd": cwd})
+        except Exception:
+            pass
     return tokens
+
+
+_UNVALIDATED_WORKSPACE: Any = object()
+
+
+def session_workspace_candidate(session_id: str, session_row: Any) -> Path | None:
+    """Resolve exact-row workspace metadata without filesystem I/O."""
+    session_id = str(session_id or "").strip()
+    row = session_row if isinstance(session_row, dict) else None
+    row_id = str((row or {}).get("id") or "").strip()
+    raw_cwd = str((row or {}).get("cwd") or "").strip()
+    if not session_id or row_id != session_id or not raw_cwd:
+        return None
+
+    candidate = Path(raw_cwd)
+    return candidate if candidate.is_absolute() else None
+
+
+def validate_session_workspace(session_id: str, session_row: Any) -> str:
+    """Return a valid durable cwd without mutating gateway task state."""
+    candidate = session_workspace_candidate(session_id, session_row)
+    if candidate is not None and candidate.is_dir():
+        return str(candidate)
+    return ""
+
+
+def restore_session_workspace(
+    context: Any,
+    session_row: Any,
+    *,
+    validated_cwd: Any = _UNVALIDATED_WORKSPACE,
+) -> str:
+    """Restore a gateway ``SessionContext`` workspace from its exact DB row.
+
+    The row is accepted only when its id exactly matches the context's raw
+    durable session id and its cwd names an existing absolute directory.
+    Invalid/missing rows explicitly clear both the context value and any stale
+    per-task tool override for that id, then leave normal runtime fallback
+    behavior in place.
+    """
+    session_id = str(getattr(context, "session_id", "") or "").strip()
+    restored = (
+        validate_session_workspace(session_id, session_row)
+        if validated_cwd is _UNVALIDATED_WORKSPACE
+        else str(validated_cwd or "")
+    )
+    setattr(context, "cwd", "")
+
+    if not restored:
+        if session_id:
+            try:
+                from tools.terminal_tool import clear_task_env_overrides
+
+                clear_task_env_overrides(session_id)
+            except Exception:
+                pass
+        return ""
+
+    setattr(context, "cwd", restored)
+    return restored
 
 
 def clear_session_vars(tokens: list) -> None:
