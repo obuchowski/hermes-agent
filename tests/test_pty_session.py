@@ -68,6 +68,39 @@ class FakeWS:
         self.close_code = code
 
 
+class SnapshotFailingWS(FakeWS):
+    async def send_bytes(self, data):
+        raise ConnectionError("socket closed during snapshot replay")
+
+
+class SnapshotCancelledWS(FakeWS):
+    async def send_bytes(self, data):
+        raise asyncio.CancelledError
+
+
+class CoordinatedWS(FakeWS):
+    def __init__(self):
+        super().__init__()
+        self.snapshot_started = asyncio.Event()
+        self.release_snapshot = asyncio.Event()
+        self.live_started = asyncio.Event()
+        self.active_sends = 0
+        self.max_active_sends = 0
+
+    async def send_bytes(self, data):
+        self.active_sends += 1
+        self.max_active_sends = max(self.max_active_sends, self.active_sends)
+        try:
+            if data == b"history":
+                self.snapshot_started.set()
+                await self.release_snapshot.wait()
+            elif data == b"live":
+                self.live_started.set()
+            self.sent.append(("bytes", bytes(data)))
+        finally:
+            self.active_sends -= 1
+
+
 @pytest.mark.asyncio
 async def test_attach_replays_buffer_then_streams_live():
     from hermes_cli.pty_session import PtySession
@@ -79,6 +112,69 @@ async def test_attach_replays_buffer_then_streams_live():
     await s.attach(ws)
     replay = b"".join(p for kind, p in ws.sent if kind == "bytes")
     assert replay == b"hello world"
+    await s.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_serializes_snapshot_before_concurrent_live_drain():
+    from hermes_cli.pty_session import PtySession
+
+    bridge = FakeBridge([b"live", None])
+    s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    s.buffer.append(b"history")
+    ws = CoordinatedWS()
+
+    attach_task = asyncio.create_task(s.attach(ws))
+    await ws.snapshot_started.wait()
+    await s.start()
+    try:
+        await asyncio.wait_for(ws.live_started.wait(), timeout=0.05)
+    except asyncio.TimeoutError:
+        pass
+    ws.release_snapshot.set()
+    await attach_task
+    await s._drain_task
+
+    assert ws.max_active_sends == 1
+    assert ws.sent == [("bytes", b"history"), ("bytes", b"live")]
+    await s.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_rolls_back_when_snapshot_replay_fails():
+    from hermes_cli.pty_session import PtySession
+
+    bridge = FakeBridge([b"buffered", b""])
+    s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    await s.start()
+    await asyncio.sleep(0.05)
+    ws = SnapshotFailingWS()
+
+    with pytest.raises(ConnectionError, match="socket closed"):
+        await s.attach(ws)
+
+    assert s.attached is False
+    assert s.last_detached_at is not None
+    assert s._ws is None
+    await s.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_rolls_back_when_snapshot_replay_is_cancelled():
+    from hermes_cli.pty_session import PtySession
+
+    bridge = FakeBridge([b"buffered", b""])
+    s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    await s.start()
+    await asyncio.sleep(0.05)
+    ws = SnapshotCancelledWS()
+
+    with pytest.raises(asyncio.CancelledError):
+        await s.attach(ws)
+
+    assert s.attached is False
+    assert s.last_detached_at is not None
+    assert s._ws is None
     await s.close()
 
 
