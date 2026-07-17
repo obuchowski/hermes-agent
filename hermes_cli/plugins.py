@@ -44,7 +44,7 @@ import threading
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
@@ -275,6 +275,52 @@ def _get_enabled_plugins() -> Optional[set]:
 # ---------------------------------------------------------------------------
 
 _VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
+
+
+@dataclass(frozen=True)
+class FreshSessionRequest:
+    """Typed request for a fresh gateway session rooted at ``cwd``.
+
+    ``cwd`` may be absolute or relative.  Gateway implementations resolve a
+    relative value against the current session's durable cwd and reject it
+    when the current session has no durable cwd.
+    """
+
+    cwd: str
+
+
+@dataclass(frozen=True)
+class FreshSessionResult:
+    """Durable identity returned after a fresh session route is activated."""
+
+    session_id: str
+    cwd: str
+    profile_name: str
+
+
+@dataclass(frozen=True)
+class PluginCommandContext:
+    """Gateway-owned capabilities available to contextual slash commands.
+
+    Plugins receive facts about the already-authenticated effective session,
+    plus narrowly-scoped lifecycle operations.  They do not receive the
+    gateway runner, session store, or profile-switching primitives.
+    """
+
+    effective_profile_name: str
+    session_id: str = ""
+    cwd: str = ""
+    _fresh_session_factory: Optional[
+        Callable[[FreshSessionRequest], Awaitable[FreshSessionResult]]
+    ] = field(default=None, repr=False, compare=False)
+
+    async def create_fresh_session(
+        self, request: FreshSessionRequest
+    ) -> FreshSessionResult:
+        """Create and activate a fresh session for this same gateway route."""
+        if self._fresh_session_factory is None:
+            raise RuntimeError("Fresh session activation is unavailable on this surface.")
+        return await self._fresh_session_factory(request)
 
 
 @dataclass
@@ -532,11 +578,17 @@ class PluginContext:
         handler: Callable,
         description: str = "",
         args_hint: str = "",
+        gateway_context: bool = False,
     ) -> None:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
-        The handler signature is ``fn(raw_args: str) -> str | None``.
+        The default handler signature is ``fn(raw_args: str) -> str | None``.
         It may also be an async callable — the gateway dispatch handles both.
+        Commands that set ``gateway_context=True`` instead receive
+        ``fn(raw_args: str, context: PluginCommandContext)`` and are rejected
+        on non-gateway surfaces.  The typed context exposes authenticated
+        session facts and narrow lifecycle capabilities without exposing the
+        gateway runner itself.
 
         Unlike ``register_cli_command()`` (which creates ``hermes <subcommand>``
         terminal commands), this registers in-session slash commands that users
@@ -577,6 +629,7 @@ class PluginContext:
             "description": description or "Plugin command",
             "plugin": self.manifest.name,
             "args_hint": (args_hint or "").strip(),
+            "gateway_context": bool(gateway_context),
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
@@ -2346,6 +2399,11 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
     return entry["handler"] if entry else None
+
+
+def get_plugin_command(name: str) -> Optional[Dict[str, Any]]:
+    """Return one plugin slash-command registration, or ``None``."""
+    return _ensure_plugins_discovered()._plugin_commands.get(name)
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
