@@ -48,8 +48,10 @@ def _build_runner(monkeypatch, tmp_path) -> GatewayRunner:
     )
 
     import gateway.run as gateway_run
+    import tools.process_registry as pr_module
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
 
     runner = GatewayRunner(GatewayConfig())
     adapter = SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())

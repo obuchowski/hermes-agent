@@ -2626,15 +2626,20 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         from tools.process_registry import format_process_notification
         return format_process_notification(evt)
 
+    if evt_type == "completion":
+        from tools.process_registry import format_process_notification
+        return format_process_notification(evt)
+
     return None
 
 
 def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
     """Drain gateway-owned watch events without spinning on requeued events.
 
-    Watch events are handled by the post-turn gateway drain. Process
-    completions are owned by their per-process watcher task, and async
-    delegation completions are owned by ``_async_delegation_watcher``.
+    Watch events and process completions are handled by the post-turn gateway
+    drain. Completion delivery is durably claimed, so racing a per-process
+    watcher is safe. Async delegation completions remain owned by
+    ``_async_delegation_watcher``.
     Requeueing async events inside ``while not queue.empty()`` would make the
     loop non-terminating, so detach the current batch first, then requeue any
     events this drain does not own after the queue is empty.
@@ -2647,11 +2652,10 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         except Exception:
             break
         evt_type = evt.get("type", "completion")
-        if evt_type in {"watch_match", "watch_disabled"}:
+        if evt_type in {"watch_match", "watch_disabled", "completion"}:
             watch_events.append(evt)
         elif evt_type == "async_delegation":
             requeue.append(evt)
-        # else: process completion events are handled by the watcher task
     for evt in requeue:
         completion_queue.put(evt)
     return watch_events
@@ -12449,10 +12453,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.error("Process watcher setup error: %s", e)
 
-            # Drain watch pattern notifications that arrived during the agent run.
-            # Watch events and completions share the same queue; process
-            # completions are already handled by the per-process watcher task
-            # above, so we only inject watch-type events here.
+            # Drain process notifications that arrived during the agent run.
+            # Completion delivery takes a durable claim, so this recovery drain
+            # can race the per-process watcher without creating a duplicate turn.
             #
             # Async-delegation completions ALSO ride this shared queue but are
             # owned by the dedicated _async_delegation_watcher (started at
@@ -12465,7 +12468,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     synth_text = _format_gateway_process_notification(evt)
                     if synth_text:
                         try:
-                            await self._inject_watch_notification(synth_text, evt)
+                            if evt.get("type") == "completion":
+                                delivered = await self._deliver_completion_notification(
+                                    synth_text, evt,
+                                )
+                                if delivered is False:
+                                    _pr.completion_queue.put(evt)
+                            else:
+                                await self._inject_watch_notification(synth_text, evt)
                         except Exception as e2:
                             logger.error("Watch notification injection error: %s", e2)
             except Exception as e:
@@ -16047,7 +16057,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                    origin = entry.origin
+                    if not getattr(origin, "profile", None) and evt.get("profile"):
+                        origin = dataclasses.replace(origin, profile=evt.get("profile"))
+                    return origin
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event session-store lookup failed for %s: %s",
@@ -16104,6 +16117,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_id=str(evt.get("thread_id") or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
+            profile=str(evt.get("profile") or "").strip() or None,
         )
 
     async def _inject_watch_notification(
@@ -16126,11 +16140,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        adapter = None
-        for p, a in self.adapters.items():
-            if p.value == platform_name:
-                adapter = a
-                break
+        adapter = self._adapter_for_source(source)
         if not adapter:
             return None
         try:
@@ -16147,10 +16157,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=metadata,
             )
             logger.info(
-                "Watch pattern notification — injecting for %s chat=%s thread=%s",
+                "Synthetic process notification accepted for injection: platform=%s",
                 platform_name,
-                source.chat_id,
-                source.thread_id,
             )
             await adapter.handle_message(synth_event)
             return True
@@ -16182,17 +16190,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _deliver_completion_notification(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
-        """Deliver once per live gateway, or return False for a retry.
+        """Deliver through the producer's durable claim/ack state.
 
         ``True`` means this caller reached adapter acceptance, ``False`` means
         injection failed and the claim was released for retry, and ``None``
-        means either another same-lifecycle caller owns/delivered the producer
-        event or the event has no gateway route. No cross-process exactly-once
-        guarantee is claimed.
+        means another caller owns/delivered the producer event or the event has
+        no gateway route. Process completions persist pending/delivering/
+        delivered; async delegations use their existing SQLite delivery state.
         """
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
+        durable_process_claimed = False
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
@@ -16210,6 +16219,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         durable_delegation_id, exc,
                     )
                     return False
+        elif evt.get("type") == "completion":
+            try:
+                from tools.process_registry import process_registry
+
+                claim_process = getattr(
+                    process_registry, "claim_completion_delivery", None,
+                )
+                process_claim = (
+                    claim_process(
+                        str(evt.get("session_id") or ""), evt.get("started_at"),
+                    )
+                    if claim_process is not None
+                    else None
+                )
+                if process_claim is False:
+                    return None
+                durable_process_claimed = process_claim is True
+            except Exception as exc:
+                logger.warning(
+                    "Could not claim durable process completion: process=%s error=%s",
+                    evt.get("session_id", "unknown"),
+                    exc,
+                )
+                return False
         if identity is not None:
             with self._completion_delivery_lock:
                 if (
@@ -16251,6 +16284,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Could not acknowledge durable async completion %s: %s",
                         durable_delegation_id, exc,
                     )
+            if durable_process_claimed:
+                from tools.process_registry import process_registry
+
+                process_registry.finish_completion_delivery(
+                    str(evt.get("session_id") or ""),
+                    evt.get("started_at"),
+                    delivered=True,
+                )
             return True
         finally:
             if identity is not None and not accepted:
@@ -16265,6 +16306,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 except Exception:
                     logger.debug("Could not release durable completion claim", exc_info=True)
+            if durable_process_claimed and not accepted:
+                try:
+                    from tools.process_registry import process_registry
+
+                    process_registry.finish_completion_delivery(
+                        str(evt.get("session_id") or ""),
+                        evt.get("started_at"),
+                        delivered=False,
+                    )
+                except Exception:
+                    logger.debug("Could not release process completion claim", exc_info=True)
 
     def _enrich_async_delegation_routing(self, evt: dict) -> None:
         """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.
@@ -16361,6 +16413,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_id = watcher.get("user_id", "")
         user_name = watcher.get("user_name", "")
         message_id = str(watcher.get("message_id") or "").strip() or None
+        parent_session_id = str(watcher.get("parent_session_id") or "").strip()
+        profile = str(watcher.get("profile") or "").strip()
         agent_notify = watcher.get("notify_on_complete", False)
         notify_mode = self._load_background_notifications_mode()
 
@@ -16379,10 +16433,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         last_output_len = 0
+        event_waited_session = None
+        if agent_notify and hasattr(process_registry, "wait_for_completion"):
+            current_session = process_registry.get(session_id)
+            if current_session is not None and current_session.exited:
+                event_waited_session = current_session
+            else:
+                event_waited_session = await asyncio.to_thread(
+                    process_registry.wait_for_completion, session_id,
+                )
         while True:
-            await asyncio.sleep(interval)
-
-            session = process_registry.get(session_id)
+            if event_waited_session is not None:
+                session = event_waited_session
+                event_waited_session = None
+            else:
+                await asyncio.sleep(interval)
+                session = process_registry.get(session_id)
             if session is None:
                 break
 
@@ -16426,6 +16492,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "user_id": user_id,
                         "user_name": user_name,
                         "message_id": message_id,
+                        "parent_session_id": parent_session_id,
+                        "profile": profile,
                         "started_at": getattr(session, "started_at", None),
                         "command": _command,
                         "exit_code": session.exit_code,
@@ -16440,8 +16508,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         synth_text, completion_evt,
                     )
                     if delivered is False:
-                        # The process remains terminal; retry after failed
-                        # adapter injection instead of suppressing the result.
+                        # The process is already terminal. Retry this same
+                        # durable completion after backoff; do not poll/list
+                        # process state again.
+                        await asyncio.sleep(interval)
+                        event_waited_session = session
                         continue
                     break
 

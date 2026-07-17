@@ -148,9 +148,11 @@ class TestAdapterCapabilityFlag:
 
 class TestTerminalNotifyGate:
     @pytest.fixture(autouse=True)
-    def _clean_watchers(self):
+    def _clean_watchers(self, monkeypatch, tmp_path):
+        import tools.process_registry as pr_module
         from tools.process_registry import process_registry
 
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
         process_registry.pending_watchers = []
         yield
         process_registry.pending_watchers = []

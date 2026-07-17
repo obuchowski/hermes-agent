@@ -1,10 +1,4 @@
-"""Lifecycle-scoped gateway delivery regressions for terminal completions.
-
-The gateway contract here is deliberately narrower than exactly-once: one live
-GatewayRunner suppresses concurrent/replayed copies after successful adapter
-injection, failed injection remains retryable, and durable async-delegation
-state (when available) is acknowledged through its authoritative SQLite API.
-"""
+"""Durable gateway delivery regressions for terminal/delegation completions."""
 
 import asyncio
 import json
@@ -16,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _drain_gateway_watch_events
 from gateway.session import SessionSource
 from tools.process_registry import ProcessRegistry, ProcessSession
 
@@ -82,6 +76,32 @@ def _completion_event(*, started_at, session_id="proc_reused"):
         "completion_reason": "exited",
         "output": "done\n",
     }
+
+
+def _durable_process(registry, *, session_id="proc_durable", started_at=50.0):
+    session = ProcessSession(
+        id=session_id,
+        command="echo done",
+        session_key="profile:programmer:agent:main:discord:channel:origin-chat",
+        started_at=started_at,
+        exited=True,
+        exit_code=0,
+        output_buffer="done\n",
+        watcher_platform="discord",
+        watcher_chat_id="origin-chat",
+        watcher_thread_id="origin-thread",
+        watcher_user_id="origin-user",
+        watcher_session_id="origin-session",
+        watcher_profile="programmer",
+        watcher_interval=5,
+        notify_on_complete=True,
+        notification_state="pending",
+        notification_completed_at=60.0,
+    )
+    session._completion_event.set()
+    registry._finished[session.id] = session
+    registry._write_checkpoint()
+    return session
 
 
 def _stop_after_sleeps(monkeypatch, runner, count):
@@ -492,3 +512,119 @@ def test_autonomous_completion_redacts_real_command_and_output_secrets(monkeypat
     delivered = adapter.handle_message.await_args.args[0]
     assert secret not in delivered.text
     assert "HOME=/home/user" in delivered.text
+
+
+def test_process_watcher_and_reconciler_race_delivers_exactly_once(isolated_registry):
+    session = _durable_process(isolated_registry, session_id="proc_race")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _blocked(_event):
+        entered.set()
+        await release.wait()
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=_blocked))
+    runner = _runner(adapter)
+    event = _completion_event(started_at=session.started_at, session_id=session.id)
+    completion_queue = queue.Queue()
+    completion_queue.put(dict(event))
+    reconciled_event = _drain_gateway_watch_events(completion_queue)[0]
+
+    async def _exercise():
+        watcher = asyncio.create_task(
+            runner._deliver_completion_notification("done", dict(event))
+        )
+        await entered.wait()
+        reconciler = asyncio.create_task(
+            runner._deliver_completion_notification("done", reconciled_event)
+        )
+        await asyncio.sleep(0)
+        release.set()
+        return await asyncio.gather(watcher, reconciler)
+
+    assert sorted(asyncio.run(_exercise()), key=str) == [None, True]
+    adapter.handle_message.assert_awaited_once()
+    assert session.notification_state == "delivered"
+
+
+def test_process_delivery_failure_releases_durable_claim_for_retry(isolated_registry):
+    session = _durable_process(isolated_registry, session_id="proc_retry")
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(side_effect=[RuntimeError("temporary"), None])
+    )
+    runner = _runner(adapter)
+    event = _completion_event(started_at=session.started_at, session_id=session.id)
+
+    async def _exercise():
+        first = await runner._deliver_completion_notification("done", dict(event))
+        state_after_failure = session.notification_state
+        second = await runner._deliver_completion_notification("done", dict(event))
+        return first, state_after_failure, second
+
+    assert asyncio.run(_exercise()) == (False, "pending", True)
+    assert adapter.handle_message.await_count == 2
+    assert session.notification_state == "delivered"
+
+
+def test_process_completion_preserves_profile_route_and_session_lineage(isolated_registry):
+    session = _durable_process(isolated_registry, session_id="proc_profile")
+    programmer_adapter = SimpleNamespace(handle_message=AsyncMock())
+    default_adapter = SimpleNamespace(handle_message=AsyncMock())
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="origin-chat",
+        chat_type="channel",
+        thread_id="origin-thread",
+        user_id="origin-user",
+        profile="programmer",
+    )
+    runner = _runner(default_adapter, origins={
+        session.session_key: SimpleNamespace(origin=source),
+    })
+    runner._profile_adapters = {"programmer": {Platform.DISCORD: programmer_adapter}}
+    event = {
+        **_completion_event(started_at=session.started_at, session_id=session.id),
+        "session_key": session.session_key,
+        "platform": "discord",
+        "chat_type": "channel",
+        "chat_id": "origin-chat",
+        "thread_id": "origin-thread",
+        "user_id": "origin-user",
+        "profile": "programmer",
+        "parent_session_id": "origin-session",
+    }
+
+    assert asyncio.run(runner._deliver_completion_notification("done", event)) is True
+    programmer_adapter.handle_message.assert_awaited_once()
+    default_adapter.handle_message.assert_not_awaited()
+    delivered = programmer_adapter.handle_message.await_args.args[0]
+    assert delivered.internal is True
+    assert delivered.source == source
+    assert delivered.source.profile == "programmer"
+    assert delivered.metadata["gateway_session_id"] == "origin-session"
+
+
+def test_successful_delivery_is_not_replayed_after_restart(
+    monkeypatch, isolated_registry, tmp_path,
+):
+    import tools.process_registry as pr_module
+
+    session = _durable_process(isolated_registry, session_id="proc_restart_dedupe")
+    first_adapter = SimpleNamespace(handle_message=AsyncMock())
+    first_runner = _runner(first_adapter)
+    event = _completion_event(started_at=session.started_at, session_id=session.id)
+    assert asyncio.run(
+        first_runner._deliver_completion_notification("done", dict(event))
+    ) is True
+
+    restarted_registry = ProcessRegistry()
+    monkeypatch.setattr(pr_module, "process_registry", restarted_registry)
+    assert restarted_registry.recover_from_checkpoint() == 1
+    assert restarted_registry.pending_watchers == []
+    replay_adapter = SimpleNamespace(handle_message=AsyncMock())
+    replay_runner = _runner(replay_adapter)
+
+    assert asyncio.run(
+        replay_runner._deliver_completion_notification("done", dict(event))
+    ) is None
+    replay_adapter.handle_message.assert_not_awaited()

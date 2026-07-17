@@ -57,6 +57,7 @@ CHECKPOINT_PATH = get_hermes_home() / "processes.json"
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
+DELIVERY_TOMBSTONE_TTL_SECONDS = 7 * 86400
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
 
@@ -115,8 +116,24 @@ class ProcessSession:
     watcher_user_name: str = ""
     watcher_thread_id: str = ""
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
+    watcher_session_id: str = ""                # Durable conversation/lineage anchor
+    watcher_chat_type: str = ""
+    watcher_profile: str = ""
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    # Durable launch state. Notification metadata is checkpointed as
+    # ``prepared`` before spawn, then changed to ``running`` only after a real
+    # PID exists. Recovery must never turn an unconfirmed launch into a
+    # completion. ``failed`` is transient: failed launches are removed from the
+    # checkpoint as part of spawn cleanup.
+    launch_state: str = "running"
+    # Durable completion delivery state. ``pending`` means delivery is owed,
+    # ``delivering`` is an exclusive claim, and ``delivered`` is the tombstone
+    # that prevents replay after a gateway restart.
+    notification_state: str = "none"
+    notification_attempts: int = 0
+    notification_completed_at: float = 0.0
+    notification_delivered_at: float = 0.0
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -161,6 +178,7 @@ class ProcessRegistry:
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        self._checkpoint_lock = threading.Lock()
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -674,6 +692,65 @@ class ProcessRegistry:
     # ----- Spawn -----
 
     @staticmethod
+    def _apply_notification_metadata(
+        session: ProcessSession, notification: Optional[Dict[str, Any]],
+    ) -> None:
+        """Attach the complete async-delivery contract before process launch."""
+        if not notification:
+            return
+        session.watcher_platform = str(notification.get("platform") or "")
+        session.watcher_chat_id = str(notification.get("chat_id") or "")
+        session.watcher_user_id = str(notification.get("user_id") or "")
+        session.watcher_user_name = str(notification.get("user_name") or "")
+        session.watcher_thread_id = str(notification.get("thread_id") or "")
+        session.watcher_message_id = str(notification.get("message_id") or "")
+        session.watcher_session_id = str(notification.get("session_id") or "")
+        session.watcher_chat_type = str(notification.get("chat_type") or "")
+        session.watcher_profile = str(notification.get("profile") or "")
+        session.watcher_interval = int(notification.get("check_interval") or 0)
+        session.notify_on_complete = bool(notification.get("notify_on_complete"))
+        session.watch_patterns = list(notification.get("watch_patterns") or [])
+        if session.notify_on_complete and session.watcher_platform:
+            session.notification_state = "pending"
+
+    def _register_before_launch(self, session: ProcessSession) -> None:
+        """Persist the complete initial record before the command can run."""
+        session.launch_state = "prepared"
+        with self._lock:
+            self._prune_if_needed()
+            self._running[session.id] = session
+        try:
+            persisted = self._write_checkpoint()
+        except Exception:
+            if session.watcher_platform and (
+                session.notify_on_complete or session.watch_patterns
+            ):
+                with self._lock:
+                    self._running.pop(session.id, None)
+                raise
+            persisted = False
+        if persisted is False and session.watcher_platform and (
+            session.notify_on_complete or session.watch_patterns
+        ):
+            with self._lock:
+                self._running.pop(session.id, None)
+            raise OSError("Could not persist background process registration")
+        if session.notify_on_complete or session.watch_patterns:
+            logger.info(
+                "Process notification registered: process=%s platform=%s profile=%s",
+                session.id,
+                session.watcher_platform or "local",
+                session.watcher_profile or "default",
+            )
+
+    def _discard_prelaunch_record(self, session: ProcessSession) -> None:
+        """Mark a failed launch and atomically remove its durable preparation."""
+        session.launch_state = "failed"
+        with self._lock:
+            self._running.pop(session.id, None)
+        self._write_checkpoint()
+
+    @staticmethod
     def _env_temp_dir(env: Any) -> str:
         """Return the writable sandbox temp dir for env-backed background tasks."""
         get_temp_dir = getattr(env, "get_temp_dir", None)
@@ -694,6 +771,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        notification: Optional[Dict[str, Any]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -713,6 +791,8 @@ class ProcessRegistry:
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
+        self._apply_notification_metadata(session, notification)
+        self._register_before_launch(session)
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
@@ -732,8 +812,20 @@ class ProcessRegistry:
                 )
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
+                session.launch_state = "running"
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
+
+                # Persist the PID before the reader can observe completion.
+                persisted = self._write_checkpoint()
+                if persisted is False and session.watcher_platform and (
+                    session.notify_on_complete or session.watch_patterns
+                ):
+                    try:
+                        pty_proc.terminate(force=True)
+                    finally:
+                        self._discard_prelaunch_record(session)
+                    raise OSError("Could not persist launched PTY process")
 
                 # PTY reader thread
                 reader = threading.Thread(
@@ -744,17 +836,18 @@ class ProcessRegistry:
                 )
                 session._reader_thread = reader
                 reader.start()
-
-                with self._lock:
-                    self._prune_if_needed()
-                    self._running[session.id] = session
-
-                self._write_checkpoint()
                 return session
 
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                if session._pty is not None:
+                    try:
+                        session._pty.terminate(force=True)
+                    except Exception:
+                        pass
+                    self._discard_prelaunch_record(session)
+                    raise
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
@@ -768,25 +861,35 @@ class ProcessRegistry:
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
-        proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
-            text=True,
-            cwd=session.cwd,
-            env=bg_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            **_popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                [user_shell, "-lic", f"set +m; {command}"],
+                text=True,
+                cwd=session.cwd,
+                env=bg_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                **_popen_kwargs,
+            )
+        except Exception:
+            self._discard_prelaunch_record(session)
+            raise
 
         session.process = proc
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
+        session.launch_state = "running"
 
         try:
+            persisted = self._write_checkpoint()
+            if persisted is False and session.watcher_platform and (
+                session.notify_on_complete or session.watch_patterns
+            ):
+                raise OSError("Could not persist launched background process")
             # Start output reader thread
             reader = threading.Thread(
                 target=self._reader_loop,
@@ -797,11 +900,6 @@ class ProcessRegistry:
             session._reader_thread = reader
             reader.start()
 
-            with self._lock:
-                self._prune_if_needed()
-                self._running[session.id] = session
-
-            self._write_checkpoint()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
@@ -821,6 +919,7 @@ class ProcessRegistry:
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            self._discard_prelaunch_record(session)
             raise
 
         return session
@@ -833,6 +932,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        notification: Optional[Dict[str, Any]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -855,6 +955,8 @@ class ProcessRegistry:
             env_ref=env,
             pid_scope="sandbox",
         )
+        self._apply_notification_metadata(session, notification)
+        self._register_before_launch(session)
 
         # Run the command in the sandbox with output capture
         temp_dir = self._env_temp_dir(env)
@@ -897,6 +999,8 @@ class ProcessRegistry:
                 session.completion_reason = "failed_start"
                 session.termination_source = "failed_start"
                 session.output_buffer = result.get("output", "").strip()
+            else:
+                session.launch_state = "running"
         except Exception as e:
             session.exited = True
             session.exit_code = -1
@@ -905,6 +1009,16 @@ class ProcessRegistry:
             session.output_buffer = f"Failed to start: {e}"
 
         if not session.exited:
+            persisted = self._write_checkpoint()
+            if persisted is False and session.watcher_platform and (
+                session.notify_on_complete or session.watch_patterns
+            ):
+                try:
+                    if session.pid:
+                        env.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                finally:
+                    self._discard_prelaunch_record(session)
+                raise OSError("Could not persist launched sandbox process")
             # Start a poller thread that periodically reads the log file
             reader = threading.Thread(
                 target=self._env_poller_loop,
@@ -915,13 +1029,8 @@ class ProcessRegistry:
             session._reader_thread = reader
             reader.start()
 
-        with self._lock:
-            self._prune_if_needed()
-            if not session.exited:
-                self._running[session.id] = session
-
-        if not session.exited:
-            self._write_checkpoint()
+        else:
+            self._discard_prelaunch_record(session)
 
         return session
 
@@ -1080,6 +1189,10 @@ class ProcessRegistry:
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
+            if was_running and session.notify_on_complete:
+                if session.notification_state == "none" and session.watcher_platform:
+                    session.notification_state = "pending"
+                session.notification_completed_at = time.time()
         session._completion_event.set()
         self._write_checkpoint()
 
@@ -1093,6 +1206,15 @@ class ProcessRegistry:
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
+                "platform": session.watcher_platform,
+                "chat_type": session.watcher_chat_type,
+                "chat_id": session.watcher_chat_id,
+                "thread_id": session.watcher_thread_id,
+                "user_id": session.watcher_user_id,
+                "user_name": session.watcher_user_name,
+                "message_id": session.watcher_message_id,
+                "parent_session_id": session.watcher_session_id,
+                "profile": session.watcher_profile,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -1103,6 +1225,108 @@ class ProcessRegistry:
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
             })
+
+    def wait_for_completion(self, session_id: str) -> Optional[ProcessSession]:
+        """Block on a process-owned completion signal without listing/polling."""
+        with self._lock:
+            session = self._running.get(session_id) or self._finished.get(session_id)
+        if session is None:
+            return None
+        if session.exited:
+            return session
+
+        if session.detached and session.pid_scope == "host" and session.pid:
+            # A recovered process is no longer our child, but Linux pidfds still
+            # provide an event-driven exit signal without repeated process polls.
+            try:
+                import select
+
+                pidfd = os.pidfd_open(session.pid)
+                try:
+                    select.select([pidfd], [], [])
+                finally:
+                    os.close(pidfd)
+                return self._refresh_detached_session(session)
+            except (AttributeError, OSError):
+                # It may already have exited between recovery and pidfd_open.
+                return self._refresh_detached_session(session)
+
+        session._completion_event.wait()
+        return session
+
+    def claim_completion_delivery(self, session_id: str, started_at: Any) -> Optional[bool]:
+        """Atomically claim one durable process-completion delivery attempt."""
+        with self._lock:
+            session = self._running.get(session_id) or self._finished.get(session_id)
+            if session is None:
+                # Legacy queue events may outlive their in-memory ProcessSession;
+                # let the gateway's lifecycle dedupe handle those.
+                return None
+            if (
+                session is not None
+                and session.exited
+                and session.notify_on_complete
+                and session.notification_state == "none"
+            ):
+                # Compatibility for an in-memory session created before this
+                # state machine (or by a focused test fixture).
+                session.notification_state = "pending"
+            if (
+                session.started_at != started_at
+                or not session.notify_on_complete
+                or not session.exited
+                or session.notification_state != "pending"
+            ):
+                state = session.notification_state if session is not None else "missing"
+                logger.info(
+                    "Process completion delivery deduped: process=%s state=%s",
+                    session_id,
+                    state,
+                )
+                return False
+            session.notification_state = "delivering"
+            session.notification_attempts += 1
+        if self._write_checkpoint() is False:
+            with self._lock:
+                if session.notification_state == "delivering":
+                    session.notification_state = "pending"
+            logger.warning(
+                "Process completion delivery claim persistence failed: process=%s",
+                session_id,
+            )
+            return False
+        logger.info(
+            "Process completion delivery attempt: process=%s attempt=%d",
+            session_id,
+            session.notification_attempts,
+        )
+        return True
+
+    def finish_completion_delivery(
+        self, session_id: str, started_at: Any, *, delivered: bool,
+    ) -> None:
+        """Acknowledge success or release a failed attempt for retry."""
+        with self._lock:
+            session = self._running.get(session_id) or self._finished.get(session_id)
+            if session is None or session.started_at != started_at:
+                return
+            if delivered:
+                session.notification_state = "delivered"
+                session.notification_delivered_at = time.time()
+            elif session.notification_state == "delivering":
+                session.notification_state = "pending"
+        persisted = self._write_checkpoint()
+        if persisted is False:
+            logger.warning(
+                "Process completion delivery state persistence failed: process=%s state=%s",
+                session_id,
+                session.notification_state,
+            )
+        logger.info(
+            "Process completion delivery %s: process=%s",
+            "succeeded" if delivered else "failed; retry pending",
+            session_id,
+        )
 
     # ----- Query Methods -----
 
@@ -1848,7 +2072,14 @@ class ProcessRegistry:
         now = time.time()
         expired = [
             sid for sid, s in self._finished.items()
-            if (now - s.started_at) > FINISHED_TTL_SECONDS
+            if (
+                s.notification_state == "none"
+                and (now - s.started_at) > FINISHED_TTL_SECONDS
+            ) or (
+                s.notification_state == "delivered"
+                and s.notification_delivered_at
+                and (now - s.notification_delivered_at) > DELIVERY_TOMBSTONE_TTL_SECONDS
+            )
         ]
         for sid in expired:
             del self._finished[sid]
@@ -1857,8 +2088,12 @@ class ProcessRegistry:
 
         # If still over limit, remove oldest finished
         total = len(self._running) + len(self._finished)
-        if total >= MAX_PROCESSES and self._finished:
-            oldest_id = min(self._finished, key=lambda sid: self._finished[sid].started_at)
+        prunable = {
+            sid: session for sid, session in self._finished.items()
+            if session.notification_state in {"none", "delivered"}
+        }
+        if total >= MAX_PROCESSES and prunable:
+            oldest_id = min(prunable, key=lambda sid: prunable[sid].started_at)
             del self._finished[oldest_id]
             self._completion_consumed.discard(oldest_id)
             self._poll_observed.discard(oldest_id)
@@ -1877,44 +2112,71 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
+    @staticmethod
+    def _checkpoint_entry(s: ProcessSession) -> Dict[str, Any]:
+        entry = {
+            "session_id": s.id,
+            "command": s.command,
+            "pid": s.pid,
+            "pid_scope": s.pid_scope,
+            "host_start_time": s.host_start_time,
+            "cwd": s.cwd,
+            "started_at": s.started_at,
+            "task_id": s.task_id,
+            "session_key": s.session_key,
+            "watcher_platform": s.watcher_platform,
+            "watcher_chat_id": s.watcher_chat_id,
+            "watcher_user_id": s.watcher_user_id,
+            "watcher_user_name": s.watcher_user_name,
+            "watcher_thread_id": s.watcher_thread_id,
+            "watcher_message_id": s.watcher_message_id,
+            "watcher_session_id": s.watcher_session_id,
+            "watcher_chat_type": s.watcher_chat_type,
+            "watcher_profile": s.watcher_profile,
+            "watcher_interval": s.watcher_interval,
+            "notify_on_complete": s.notify_on_complete,
+            "watch_patterns": s.watch_patterns,
+            "exited": s.exited,
+            "exit_code": s.exit_code,
+            "completion_reason": s.completion_reason,
+            "termination_source": s.termination_source,
+            "launch_state": s.launch_state,
+            "notification_state": s.notification_state,
+            "notification_attempts": s.notification_attempts,
+            "notification_completed_at": s.notification_completed_at,
+            "notification_delivered_at": s.notification_delivered_at,
+        }
+        if s.exited and s.notify_on_complete:
+            entry["output_buffer"] = s.output_buffer[-2000:]
+        return entry
+
     def _write_checkpoint(self):
-        """Write running process metadata to checkpoint file atomically."""
-        try:
-            with self._lock:
-                entries = []
-                for s in self._running.values():
-                    if not s.exited:
-                        # Lazily backfill the kernel start time for host PIDs so
-                        # recovery after restart can detect PID recycling even
-                        # for sessions spawned before this field existed.
-                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
-                            s.host_start_time = self._safe_host_start_time(s.pid)
-                        entries.append({
-                            "session_id": s.id,
-                            "command": s.command,
-                            "pid": s.pid,
-                            "pid_scope": s.pid_scope,
-                            "host_start_time": s.host_start_time,
-                            "cwd": s.cwd,
-                            "started_at": s.started_at,
-                            "task_id": s.task_id,
-                            "session_key": s.session_key,
-                            "watcher_platform": s.watcher_platform,
-                            "watcher_chat_id": s.watcher_chat_id,
-                            "watcher_user_id": s.watcher_user_id,
-                            "watcher_user_name": s.watcher_user_name,
-                            "watcher_thread_id": s.watcher_thread_id,
-                            "watcher_message_id": s.watcher_message_id,
-                            "watcher_interval": s.watcher_interval,
-                            "notify_on_complete": s.notify_on_complete,
-                            "watch_patterns": s.watch_patterns,
-                        })
-            
-            # Atomic write to avoid corruption on crash
-            from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
-        except Exception as e:
-            logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+        """Atomically persist running jobs and durable notification tombstones."""
+        with self._checkpoint_lock:
+            try:
+                with self._lock:
+                    entries = []
+                    for s in self._running.values():
+                        if not s.exited:
+                            # Lazily backfill the kernel start time for host PIDs so
+                            # recovery after restart can detect PID recycling even
+                            # for sessions spawned before this field existed.
+                            if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+                                s.host_start_time = self._safe_host_start_time(s.pid)
+                            entries.append(self._checkpoint_entry(s))
+                    for s in self._finished.values():
+                        if s.notify_on_complete and s.notification_state in {
+                            "pending", "delivering", "delivered",
+                        }:
+                            entries.append(self._checkpoint_entry(s))
+
+                # Atomic write to avoid corruption on crash
+                from utils import atomic_json_write
+                atomic_json_write(CHECKPOINT_PATH, entries)
+                return True
+            except Exception as e:
+                logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+                return False
 
     def recover_from_checkpoint(self) -> int:
         """
@@ -1933,38 +2195,39 @@ class ProcessRegistry:
         recovered = 0
         for entry in entries:
             pid = entry.get("pid")
-            if not pid:
-                continue
-
             pid_scope = entry.get("pid_scope", "host")
-            if pid_scope != "host":
-                # Sandbox-backed processes keep only in-sandbox PIDs in the
-                # checkpoint, which are not meaningful to the restarted host
-                # process once the original environment handle is gone.
+            # Legacy entries predate the launch lifecycle and necessarily came
+            # from a confirmed launch. A new ``prepared`` record, however, may
+            # represent a crash before or around spawn and can never produce a
+            # completion notification.
+            launch_state = str(entry.get("launch_state") or "running")
+            if launch_state != "running":
                 logger.info(
-                    "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
+                    "Discarding unconfirmed process launch: %s (state=%s)",
                     entry.get("command", "unknown")[:60],
-                    pid,
-                    pid_scope,
+                    launch_state,
                 )
                 continue
 
-            # The PID must be alive AND still the same process we spawned. A
-            # bare liveness check is unsafe: across a restart (especially a
-            # reboot or long uptime) the kernel may have recycled this number
-            # onto an unrelated process — adopting it would let a later kill or
-            # watcher tree-kill a stranger (e.g. a browser). Re-validate the
-            # kernel start time recorded in the checkpoint.
+            notification_state = str(entry.get("notification_state") or "none")
+            notify_requested = bool(entry.get("notify_on_complete", False))
+            recorded_finished = bool(entry.get("exited", False))
             recorded_start = entry.get("host_start_time")
-            if not self._host_pid_is_ours(pid, recorded_start):
-                if self._is_host_pid_alive(pid):
-                    logger.info(
-                        "Not recovering session %s: pid %d is alive but its "
-                        "start time no longer matches — PID was recycled onto "
-                        "an unrelated process; refusing to adopt it.",
-                        entry.get("session_id", "?"), pid,
-                    )
-                continue
+            pid_is_ours = bool(
+                pid_scope == "host"
+                and pid
+                and self._host_pid_is_ours(pid, recorded_start)
+            )
+
+            # A durable completion/tombstone survives independently of PID
+            # liveness. A running record whose PID died while the gateway was
+            # down is promoted to a retryable completion here.
+            recover_as_finished = recorded_finished or (
+                pid_scope == "host"
+                and notify_requested
+                and notification_state in {"pending", "delivering"}
+                and not pid_is_ours
+            )
 
             session = ProcessSession(
                 id=entry["session_id"],
@@ -1976,17 +2239,86 @@ class ProcessRegistry:
                 pid_scope=pid_scope,
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
-                detached=True,  # Can't read output, but can report status + kill
+                detached=not recover_as_finished,
+                exited=recover_as_finished,
+                exit_code=entry.get("exit_code"),
+                completion_reason=entry.get("completion_reason", "exited"),
+                termination_source=entry.get("termination_source", ""),
+                launch_state=launch_state,
+                output_buffer=entry.get("output_buffer", ""),
                 watcher_platform=entry.get("watcher_platform", ""),
                 watcher_chat_id=entry.get("watcher_chat_id", ""),
                 watcher_user_id=entry.get("watcher_user_id", ""),
                 watcher_user_name=entry.get("watcher_user_name", ""),
                 watcher_thread_id=entry.get("watcher_thread_id", ""),
                 watcher_message_id=entry.get("watcher_message_id", ""),
+                watcher_session_id=entry.get("watcher_session_id", ""),
+                watcher_chat_type=entry.get("watcher_chat_type", ""),
+                watcher_profile=entry.get("watcher_profile", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
-                notify_on_complete=entry.get("notify_on_complete", False),
+                notify_on_complete=notify_requested,
+                notification_state=notification_state,
+                notification_attempts=int(entry.get("notification_attempts") or 0),
+                notification_completed_at=float(entry.get("notification_completed_at") or 0),
+                notification_delivered_at=float(entry.get("notification_delivered_at") or 0),
                 watch_patterns=entry.get("watch_patterns", []),
             )
+
+            if recover_as_finished:
+                session._completion_event.set()
+                if session.notification_state == "delivering":
+                    session.notification_state = "pending"
+                    logger.info(
+                        "Process completion recovery released interrupted claim: process=%s",
+                        session.id,
+                    )
+                with self._lock:
+                    self._finished[session.id] = session
+                recovered += 1
+                if session.notification_state == "pending":
+                    self.pending_watchers.append(self._watcher_for_session(session))
+                    logger.info(
+                        "Process completion recovered for delivery: process=%s",
+                        session.id,
+                    )
+                else:
+                    logger.info(
+                        "Process completion recovery deduped: process=%s state=%s",
+                        session.id,
+                        session.notification_state,
+                    )
+                continue
+
+            if pid_scope != "host":
+                # Only live-process reattachment needs a host PID. Durable
+                # already-exited completion records were handled above.
+                logger.info(
+                    "Skipping live recovery for non-host process: %s "
+                    "(pid=%s, scope=%s)",
+                    entry.get("command", "unknown")[:60],
+                    pid,
+                    pid_scope,
+                )
+                continue
+
+            if not pid:
+                continue
+
+            # The PID must be alive AND still the same process we spawned. A
+            # bare liveness check is unsafe: across a restart (especially a
+            # reboot or long uptime) the kernel may have recycled this number
+            # onto an unrelated process — adopting it would let a later kill or
+            # watcher tree-kill a stranger (e.g. a browser). Re-validate the
+            # kernel start time recorded in the checkpoint.
+            if not pid_is_ours:
+                if self._is_host_pid_alive(pid):
+                    logger.info(
+                        "Not recovering session %s: pid %d is alive but its "
+                        "start time no longer matches — PID was recycled onto "
+                        "an unrelated process; refusing to adopt it.",
+                        entry.get("session_id", "?"), pid,
+                    )
+                continue
             with self._lock:
                 self._running[session.id] = session
             recovered += 1
@@ -1994,22 +2326,29 @@ class ProcessRegistry:
 
             # Re-enqueue watcher so gateway can resume notifications
             if session.watcher_interval > 0:
-                self.pending_watchers.append({
-                    "session_id": session.id,
-                    "check_interval": session.watcher_interval,
-                    "session_key": session.session_key,
-                    "platform": session.watcher_platform,
-                    "chat_id": session.watcher_chat_id,
-                    "user_id": session.watcher_user_id,
-                    "user_name": session.watcher_user_name,
-                    "thread_id": session.watcher_thread_id,
-                    "message_id": session.watcher_message_id,
-                    "notify_on_complete": session.notify_on_complete,
-                })
+                self.pending_watchers.append(self._watcher_for_session(session))
 
         self._write_checkpoint()
 
         return recovered
+
+    @staticmethod
+    def _watcher_for_session(session: ProcessSession) -> Dict[str, Any]:
+        return {
+            "session_id": session.id,
+            "check_interval": session.watcher_interval or 5,
+            "session_key": session.session_key,
+            "platform": session.watcher_platform,
+            "chat_type": session.watcher_chat_type,
+            "chat_id": session.watcher_chat_id,
+            "user_id": session.watcher_user_id,
+            "user_name": session.watcher_user_name,
+            "thread_id": session.watcher_thread_id,
+            "message_id": session.watcher_message_id,
+            "parent_session_id": session.watcher_session_id,
+            "profile": session.watcher_profile,
+            "notify_on_complete": session.notify_on_complete,
+        }
 
 
 # Module-level singleton
