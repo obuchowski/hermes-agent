@@ -50,6 +50,7 @@ class PtySession:
         self._read_timeout = read_timeout
         self._ws = None
         self._drain_task: Optional[asyncio.Task] = None
+        self._stream_lock = asyncio.Lock()
 
     async def start(self) -> None:
         self._drain_task = asyncio.create_task(self._drain())
@@ -59,38 +60,49 @@ class PtySession:
         while True:
             chunk = await loop.run_in_executor(None, self.bridge.read, self._read_timeout)
             if chunk is None:                       # EOF — the agent process exited
-                self.alive = False
-                ws = self._ws
-                if ws is not None:
-                    try:
-                        await ws.close(code=WS_CLOSE_PROCESS_EXITED)
-                    except Exception:
-                        pass
+                async with self._stream_lock:
+                    self.alive = False
+                    ws = self._ws
+                    if ws is not None:
+                        try:
+                            await ws.close(code=WS_CLOSE_PROCESS_EXITED)
+                        except Exception:
+                            pass
                 return
             if not chunk:                            # idle tick
                 await asyncio.sleep(0)
                 continue
-            self.buffer.append(chunk)
-            ws = self._ws
-            if ws is not None:
-                try:
-                    await ws.send_bytes(chunk)
-                except Exception:
-                    pass                             # detached mid-send; keep buffering
+            async with self._stream_lock:
+                self.buffer.append(chunk)
+                ws = self._ws
+                if ws is not None:
+                    try:
+                        await ws.send_bytes(chunk)
+                    except Exception:
+                        pass                         # detached mid-send; keep buffering
 
     async def attach(self, ws) -> None:
-        old = self._ws
-        if old is not None and old is not ws:
-            try:
-                await old.close(code=WS_CLOSE_SUPERSEDED)
-            except Exception:
-                pass
-        self._ws = ws
-        self.attached = True
-        self.last_detached_at = None
-        snap = self.buffer.snapshot()
-        if snap:
-            await ws.send_bytes(snap)
+        async with self._stream_lock:
+            old = self._ws
+            if old is not None and old is not ws:
+                try:
+                    await old.close(code=WS_CLOSE_SUPERSEDED)
+                except Exception:
+                    pass
+            self._ws = ws
+            self.attached = True
+            self.last_detached_at = None
+            snap = self.buffer.snapshot()
+            if snap:
+                try:
+                    await ws.send_bytes(snap)
+                except (asyncio.CancelledError, Exception):
+                    # Snapshot replay happens before the route's receive loop.
+                    # Roll back atomically so a later reconnect can attach.
+                    self._ws = None
+                    self.attached = False
+                    self.last_detached_at = time.monotonic()
+                    raise
 
     def detach(self, ws) -> None:
         # Only the currently-attached socket may mark the session detached.

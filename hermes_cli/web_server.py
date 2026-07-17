@@ -14832,6 +14832,19 @@ PTY_REGISTRY = PtySessionRegistry(
 )
 
 
+async def _attach_pty_session(session, ws) -> bool:
+    """Attach a keep-alive PTY, treating a mid-replay disconnect as normal."""
+    try:
+        await session.attach(ws)
+    except WebSocketDisconnect:
+        return False
+    except RuntimeError as exc:
+        if str(exc) == 'Cannot call "send" once a close message has been sent.':
+            return False
+        raise
+    return True
+
+
 async def _legacy_pump(ws: "WebSocket", bridge) -> None:
     """Original 1:1 socket<->PTY pump: stream until disconnect, then close the
     bridge. Used when no ``?attach=`` token is supplied (keep-alive opt-in).
@@ -16174,7 +16187,8 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
-    await session.attach(ws)
+    if not await _attach_pty_session(session, ws):
+        return
 
     # --- writer loop: WebSocket → PTY master ----------------------------
     # No reader task here: the session's drain task (spawned once per PTY,

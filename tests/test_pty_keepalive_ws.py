@@ -4,6 +4,40 @@ from hermes_cli import web_server
 
 
 @pytest.mark.asyncio
+async def test_snapshot_disconnect_ends_attach_without_asgi_error():
+    from starlette.websockets import WebSocketDisconnect
+
+    class DisconnectedSession:
+        async def attach(self, ws):
+            raise WebSocketDisconnect(code=1006)
+
+    attached = await web_server._attach_pty_session(DisconnectedSession(), object())
+
+    assert attached is False
+
+
+@pytest.mark.asyncio
+async def test_snapshot_disconnected_state_runtime_error_ends_attach_cleanly():
+    class DisconnectedSession:
+        async def attach(self, ws):
+            raise RuntimeError('Cannot call "send" once a close message has been sent.')
+
+    attached = await web_server._attach_pty_session(DisconnectedSession(), object())
+
+    assert attached is False
+
+
+@pytest.mark.asyncio
+async def test_snapshot_attach_does_not_swallow_unrelated_failure():
+    class BrokenSession:
+        async def attach(self, ws):
+            raise RuntimeError("unexpected attach failure")
+
+    with pytest.raises(RuntimeError, match="unexpected attach failure"):
+        await web_server._attach_pty_session(BrokenSession(), object())
+
+
+@pytest.mark.asyncio
 async def test_attach_token_reuses_same_session(monkeypatch):
     """Two connects with the same ?attach= token hit one spawned bridge."""
     spawned = []
