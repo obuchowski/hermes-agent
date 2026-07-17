@@ -6082,7 +6082,10 @@ class SessionDB:
                     self._import_error(index, session_id, "session must be JSON serializable")
                 )
                 continue
-            if session_bytes > self._IMPORT_MAX_SESSION_BYTES:
+            if (
+                trusted_profile_name is None
+                and session_bytes > self._IMPORT_MAX_SESSION_BYTES
+            ):
                 errors.append(
                     self._import_error(index, session_id, "session exceeds the import size limit")
                 )

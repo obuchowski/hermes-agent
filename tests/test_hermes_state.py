@@ -2305,6 +2305,57 @@ class TestDeleteAndExport:
         finally:
             target.close()
 
+    def test_transfer_session_lineage_from_accepts_large_trusted_local_session(
+        self, db, tmp_path
+    ):
+        db.create_session(
+            session_id="large-handoff",
+            source="cli",
+            profile_name="programmer",
+        )
+        large_content = "x" * (SessionDB._IMPORT_MAX_SESSION_BYTES + 1)
+        db.append_message("large-handoff", role="user", content=large_content)
+        db._conn.execute(
+            "UPDATE messages SET active = 0, compacted = 1 "
+            "WHERE session_id = 'large-handoff'"
+        )
+        db._conn.commit()
+
+        exported = db.export_session("large-handoff")
+        exported["messages"] = db.get_messages(
+            "large-handoff", include_inactive=True
+        )
+        payload_bytes = len(
+            json.dumps(exported, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+        assert payload_bytes > SessionDB._IMPORT_MAX_SESSION_BYTES
+        assert payload_bytes < SessionDB._IMPORT_MAX_TOTAL_BYTES
+
+        target = SessionDB(db_path=tmp_path / "gateway_state.db")
+        try:
+            result = target.transfer_session_lineage_from(
+                db,
+                "large-handoff",
+                profile_name="programmer",
+            )
+
+            assert result == {
+                "ok": True,
+                "session_id": "large-handoff",
+                "transferred_ids": ["large-handoff"],
+                "already_present_ids": [],
+            }
+            assert target.get_session("large-handoff")["profile_name"] == "programmer"
+            messages = target.get_messages("large-handoff", include_inactive=True)
+            assert len(messages) == 1
+            assert messages[0]["content"] == large_content
+            assert messages[0]["active"] == 0
+            assert messages[0]["compacted"] == 1
+        finally:
+            target.close()
+
     def test_transfer_session_lineage_retry_is_idempotent_and_collision_fails_closed(
         self, db, tmp_path
     ):
