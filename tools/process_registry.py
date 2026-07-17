@@ -57,6 +57,7 @@ MAX_OUTPUT_CHARS = 200_000      # rolling output buffer
 # output IS the payload (a bot DM's reply) asks for more per process (completion_output_chars).
 COMPLETION_OUTPUT_CHARS = 2000
 FINISHED_TTL_SECONDS = 1800     # keep finished processes 30 minutes
+DELIVERY_TOMBSTONE_TTL_SECONDS = 7 * 86400
 MAX_PROCESSES = 64              # max tracked processes (LRU pruning)
 
 # Watch-pattern rate limiting, PER SESSION: one watch-match notification per
@@ -574,12 +575,22 @@ class ProcessSession:
     watcher_user_name: str = ""
     watcher_thread_id: str = ""
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
+    watcher_chat_type: str = ""
+    watcher_profile: str = ""
     watcher_interval: int = 0                   # 0 = no watcher configured
     # Session-db id of the spawning conversation; lets the gateway drop completions whose
     # session was closed at a user boundary (/new) instead of injecting into the NEW one.
     parent_session_id: str = ""
     notify_on_complete: bool = False            # Queue agent notification on exit
     completion_output_chars: int = 0            # Output chars the completion carries; 0 = COMPLETION_OUTPUT_CHARS
+    # Durable launch and completion-delivery lifecycle. A prepared launch is
+    # persisted before spawn; pending/delivering/delivered make retries and
+    # gateway restarts safe without duplicate accepted deliveries.
+    launch_state: str = "running"
+    notification_state: str = "none"
+    notification_attempts: int = 0
+    notification_completed_at: float = 0.0
+    notification_delivered_at: float = 0.0
     watch_patterns: List[str] = field(default_factory=list)
     heartbeat_seconds: int = 0                  # 0 = off; else a "heartbeat" event every N s while running
     total_output_chars: int = 0                 # Chars ever ingested (the buffer is a rolling tail)
@@ -645,7 +656,10 @@ class ProcessSession:
 
 
 # Watcher routing fields, in event-dict key order (``watcher_<key>`` on the session).
-_WATCHER_ROUTE_KEYS = ("platform", "chat_id", "user_id", "user_name", "thread_id", "message_id")
+_WATCHER_ROUTE_KEYS = (
+    "platform", "chat_type", "chat_id", "user_id", "user_name", "thread_id",
+    "message_id", "profile",
+)
 # Session fields persisted verbatim in the crash-recovery checkpoint (plus
 # ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
 _CHECKPOINT_FIELDS = (
@@ -653,7 +667,10 @@ _CHECKPOINT_FIELDS = (
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
-    "heartbeat_seconds", "persist_on_release")
+    "heartbeat_seconds", "persist_on_release",
+    "launch_state", "notification_state",
+    "notification_attempts", "notification_completed_at", "notification_delivered_at",
+    "exited", "exit_code", "completion_reason", "termination_source")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -712,6 +729,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        self._checkpoint_lock = threading.Lock()
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
         # Unified queue for all background events (distinguished by "type"); the CLI
@@ -1115,6 +1133,43 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             started_at=time.time(), **extra)
 
     @staticmethod
+    def _apply_notification_metadata(
+        session: ProcessSession, notification: Optional[Dict[str, Any]],
+    ) -> None:
+        """Attach the complete async-delivery contract before process launch."""
+        if not notification:
+            return
+        for key in _WATCHER_ROUTE_KEYS:
+            setattr(session, f"watcher_{key}", str(notification.get(key) or ""))
+        session.parent_session_id = str(notification.get("session_id") or "")
+        session.watcher_interval = int(notification.get("check_interval") or 0)
+        session.notify_on_complete = bool(notification.get("notify_on_complete"))
+        session.watch_patterns = list(notification.get("watch_patterns") or [])
+        if session.notify_on_complete and session.watcher_platform:
+            session.notification_state = "pending"
+
+    def _register_before_launch(self, session: ProcessSession) -> None:
+        """Persist complete notification metadata before the command may run."""
+        session.launch_state = "prepared"
+        with self._lock:
+            self._prune_if_needed()
+            self._running[session.id] = session
+        persisted = self._write_checkpoint()
+        if persisted is False and session.watcher_platform and (
+            session.notify_on_complete or session.watch_patterns
+        ):
+            with self._lock:
+                self._running.pop(session.id, None)
+            raise OSError("Could not persist background process registration")
+
+    def _discard_prelaunch_record(self, session: ProcessSession) -> None:
+        """Remove a failed/unconfirmed launch from durable state."""
+        session.launch_state = "failed"
+        with self._lock:
+            self._running.pop(session.id, None)
+        self._write_checkpoint()
+
+    @staticmethod
     def _env_temp_dir(env: Any) -> str:
         """Return the writable sandbox temp dir for env-backed background tasks."""
         get_temp_dir = getattr(env, "get_temp_dir", None)
@@ -1162,13 +1217,18 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         reader = threading.Thread(target=copy_context().run, args=(reader_target, session, *extra_args),
                                   daemon=True, name=reader_name)
         session._reader_thread = reader
+        session.launch_state = "running"
         with self._lock:
             self._prune_if_needed()
             # Completion takes this lock too. Starting here also leaves no
             # ghost entry if the interpreter cannot start another thread.
             reader.start()
             self._running[session.id] = session
-        self._write_checkpoint()
+        persisted = self._write_checkpoint()
+        if persisted is False and session.watcher_platform and (
+            session.notify_on_complete or session.watch_patterns
+        ):
+            raise OSError("Could not persist launched background process")
 
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
         """PTY spawn for interactive CLI tools (Codex, Claude Code, REPLs).
@@ -1196,7 +1256,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
     def spawn_local(
         self, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
         env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "",
-        persist_on_release: bool = False) -> ProcessSession:
+        persist_on_release: bool = False, notification: Optional[Dict[str, Any]] = None) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends use
         spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
         for interactive CLIs, falling back to a plain pipe when unavailable or failing.
@@ -1210,6 +1270,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         safe_command = _rewrite_bg(command)
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
                                     persist_on_release=persist_on_release)
+        self._apply_notification_metadata(session, notification)
+        self._register_before_launch(session)
         pty_scope_attempted = False
         if use_pty:
             try:
@@ -1238,10 +1300,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         # share the foreground process group and background spawns would stop the whole
         # session (observed as dead TUIs in state T). Cgroup isolation is unaffected —
         # the scope attaches to the invoked process, not the spawning session.
-        proc = subprocess.Popen(
-            spawn_argv, text=True, cwd=session.cwd, env=spawn_env, encoding="utf-8",
-            errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            start_new_session=True, **_popen_kwargs)
+        try:
+            proc = subprocess.Popen(
+                spawn_argv, text=True, cwd=session.cwd, env=spawn_env, encoding="utf-8",
+                errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                start_new_session=True, **_popen_kwargs)
+        except Exception:
+            self._discard_prelaunch_record(session)
+            raise
         session.process = proc
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
@@ -1249,6 +1315,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             self._track_started(session, self._reader_loop, f"proc-reader-{session.id}")
         except Exception:
             self._reap_untracked(session, proc)
+            self._discard_prelaunch_record(session)
             raise
         return session
 
@@ -1288,7 +1355,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
 
     def spawn_via_env(
         self, env: Any, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False) -> ProcessSession:
+        timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False,
+        notification: Optional[Dict[str, Any]] = None) -> ProcessSession:
         """Spawn a background process inside a non-local backend's sandbox.
         The command is wrapped to capture its in-sandbox PID and redirect output to a
         log file that later execute() calls poll. No live pipe or stdin, but it runs in
@@ -1296,6 +1364,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         agent-lifecycle kill sweeps (#41225)."""
         session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox",
                                     persist_on_release=persist_on_release)
+        self._apply_notification_metadata(session, notification)
+        self._register_before_launch(session)
         temp_dir = self._env_temp_dir(env)
         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
         q = shlex.quote
@@ -1317,11 +1387,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             session.mark_exited(-1, "failed_start", "failed_start")
             session.output_buffer = f"Failed to start: {e}"
         if session.exited:
-            with self._lock:
-                self._prune_if_needed()
+            self._discard_prelaunch_record(session)
         else:
-            self._track_started(
-                session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
+            try:
+                self._track_started(
+                    session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
+            except Exception:
+                with suppress(Exception):
+                    if session.pid:
+                        env.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                self._discard_prelaunch_record(session)
+                raise
         return session
 
     # ----- Reader / Poller Threads -----
@@ -1596,6 +1672,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 save_completed_result(session)
                 self._running.pop(session.id)
             self._finished[session.id] = session
+            if was_running and session.notify_on_complete:
+                if session.notification_state == "none" and session.watcher_platform:
+                    session.notification_state = "pending"
+                session.notification_completed_at = time.time()
         # Release the retained Popen/PTY handles now: otherwise every
         # finished-but-unpruned session keeps its stdout pipe (or PTY master)
         # FD open until FINISHED_TTL_SECONDS elapses, and heavy background
@@ -1626,6 +1706,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 "owner_task_id": session.owner_task_id,
                 "command": session.command,
                 **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
+                "platform": session.watcher_platform,
+                "chat_type": session.watcher_chat_type,
+                "chat_id": session.watcher_chat_id,
+                "thread_id": session.watcher_thread_id,
+                "user_id": session.watcher_user_id,
+                "user_name": session.watcher_user_name,
+                "message_id": session.watcher_message_id,
+                "parent_session_id": session.parent_session_id,
+                "profile": session.watcher_profile,
                 **self._exit_fields(session),
                 # A consumer that relays the output (a bot DM's reply) must know it is not whole.
                 **_completion_output(session),
@@ -1635,6 +1724,73 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             }
             _redact_process_result(notification)
             self.completion_queue.put(notification)
+
+    def wait_for_completion(self, session_id: str) -> Optional[ProcessSession]:
+        """Block on a process-owned completion signal without polling."""
+        with self._lock:
+            session = self._running.get(session_id) or self._finished.get(session_id)
+        if session is None or session.exited:
+            return session
+        if session.detached and session.pid_scope == "host" and session.pid:
+            try:
+                import select
+                pidfd = os.pidfd_open(session.pid)
+                try:
+                    select.select([pidfd], [], [])
+                finally:
+                    os.close(pidfd)
+                return self._refresh_detached_session(session)
+            except (AttributeError, OSError):
+                return self._refresh_detached_session(session)
+        session._completion_event.wait()
+        return session
+
+    def claim_completion_delivery(self, session_id: str, started_at: Any) -> Optional[bool]:
+        """Atomically claim one durable process-completion delivery attempt."""
+        with self._lock:
+            session = self._running.get(session_id) or self._finished.get(session_id)
+            if session is None:
+                return None  # legacy queued event; lifecycle dedupe remains available
+            if session.exited and session.notify_on_complete and session.notification_state == "none":
+                session.notification_state = "pending"
+            if (
+                session.started_at != started_at
+                or not session.notify_on_complete
+                or not session.exited
+                or session.notification_state != "pending"
+            ):
+                logger.info(
+                    "Process completion delivery deduped: process=%s state=%s",
+                    session_id, session.notification_state,
+                )
+                return False
+            session.notification_state = "delivering"
+            session.notification_attempts += 1
+        if self._write_checkpoint() is False:
+            with self._lock:
+                if session.notification_state == "delivering":
+                    session.notification_state = "pending"
+            return False
+        return True
+
+    def finish_completion_delivery(
+        self, session_id: str, started_at: Any, *, delivered: bool,
+    ) -> None:
+        """Acknowledge success or release a failed attempt for retry."""
+        with self._lock:
+            session = self._running.get(session_id) or self._finished.get(session_id)
+            if session is None or session.started_at != started_at:
+                return
+            if delivered:
+                session.notification_state = "delivered"
+                session.notification_delivered_at = time.time()
+            elif session.notification_state == "delivering":
+                session.notification_state = "pending"
+        if self._write_checkpoint() is False:
+            logger.warning(
+                "Process completion delivery state persistence failed: process=%s state=%s",
+                session_id, session.notification_state,
+            )
 
     @staticmethod
     def _exit_fields(session: ProcessSession) -> dict:
@@ -2569,15 +2725,27 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
     # ----- Cleanup / Pruning -----
 
     def _prune_if_needed(self):
-        """Drop expired finished sessions, then the oldest survivor while over
-        MAX_PROCESSES. Must hold _lock. A session whose scope stop is still pending is kept
-        either way: it is kill_all's only handle on a scope that may hold live descendants."""
+        """Drop safe sessions, preserving pending deliveries and scope-stop handles. Must hold _lock."""
         now = time.time()
-        prunable = {sid: s for sid, s in self._finished.items() if not getattr(s, "_scope_stop_pending", False)}
-        expired = [sid for sid, s in prunable.items() if (now - s.started_at) > FINISHED_TTL_SECONDS]
-        over_cap = len(self._running) + len(self._finished) - len(expired) >= MAX_PROCESSES
-        if over_cap and (survivors := [sid for sid in prunable if sid not in expired]):
-            expired.append(min(survivors, key=lambda sid: self._finished[sid].started_at))
+        safe = {sid: s for sid, s in self._finished.items()
+                if not getattr(s, "_scope_stop_pending", False)}
+        expired = [
+            sid for sid, s in safe.items()
+            if (
+                s.notification_state == "none"
+                and (now - s.started_at) > FINISHED_TTL_SECONDS
+            ) or (
+                s.notification_state == "delivered"
+                and s.notification_delivered_at
+                and (now - s.notification_delivered_at) > DELIVERY_TOMBSTONE_TTL_SECONDS
+            )
+        ]
+        prunable = {
+            sid: s for sid, s in safe.items()
+            if sid not in expired and s.notification_state in {"none", "delivered"}
+        }
+        if len(self._running) + len(self._finished) - len(expired) >= MAX_PROCESSES and prunable:
+            expired.append(min(prunable, key=lambda sid: prunable[sid].started_at))
         for sid in expired:
             # Belt-and-suspenders handle release: sessions normally arrive in
             # _finished via _move_to_finished(), which already released their
@@ -2587,13 +2755,22 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             # release is idempotent, so double-closing is safe.
             self._release_finished_handles(self._finished[sid])
             del self._finished[sid]
-        # Belt-and-suspenders against module-lifetime growth: forget consumed /
-        # poll-observed marks for any session no longer tracked at all.
         tracked = self._running.keys() | self._finished.keys()
         self._completion_consumed &= tracked
         self._poll_observed &= tracked
 
 
+
+    @staticmethod
+    def _watcher_for_session(session: ProcessSession) -> Dict[str, Any]:
+        return {
+            "session_id": session.id,
+            "check_interval": session.watcher_interval or 5,
+            "session_key": session.session_key,
+            **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
+            "notify_on_complete": session.notify_on_complete,
+            "parent_session_id": session.parent_session_id,
+        }
 
 
 process_registry = ProcessRegistry()

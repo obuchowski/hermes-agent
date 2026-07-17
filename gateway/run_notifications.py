@@ -74,7 +74,10 @@ def _update_output_tail(output: str, limit: int) -> str:
 
 _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
 # Routing fields copied verbatim from a process watcher onto its synthetic completion event.
-_WATCHER_ROUTE_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id", "user_name")
+_WATCHER_ROUTE_FIELDS = (
+    "session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id",
+    "user_name", "profile",
+)
 _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 # Storage causes that clear on their own (one session's lease/compression, not the store): the
 # home-channel notice appends the operator restart tail for every OTHER cause.
@@ -1093,7 +1096,10 @@ class GatewayNotificationsMixin:
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return self._restored_source(entry)
+                    origin = self._restored_source(entry)
+                    if not getattr(origin, "profile", None) and evt.get("profile"):
+                        origin = dataclasses.replace(origin, profile=evt.get("profile"))
+                    return origin
             except Exception as exc:
                 logger.debug("Synthetic process-event session-store lookup failed for %s: %s", session_key, exc)
             cached_source = self._get_cached_session_source(session_key)
@@ -1143,7 +1149,7 @@ class GatewayNotificationsMixin:
             )
         return SessionSource(
             platform=platform, chat_id=chat_id, chat_type=chat_type, thread_id=_opt("thread_id"),
-            user_id=_opt("user_id"), user_name=_opt("user_name"), scope_id=scope_id, profile=profile,
+            user_id=_opt("user_id"), user_name=_opt("user_name"), scope_id=scope_id, profile=profile or _opt("profile"),
         )
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
@@ -1166,7 +1172,10 @@ class GatewayNotificationsMixin:
                 if not synth_text:
                     continue
                 try:
-                    delivered = await self._inject_watch_notification(synth_text, evt)
+                    if evt.get("type") == "completion":
+                        delivered = await self._enqueue_process_completion_notification(synth_text, evt)
+                    else:
+                        delivered = await self._inject_watch_notification(synth_text, evt)
                 except Exception:
                     logger.exception("Watch notification injection error")
                     delivered = False
@@ -1585,10 +1594,20 @@ class GatewayNotificationsMixin:
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
         accepted = identity_claimed = refused = False
+        process_claimed = False
+        process_registry = None
         try:
             claim = await self._preflight_completion_delivery(evt)
             if not claim.proceed:
                 return claim.early_result
+            if evt.get("type") == "completion":
+                from tools.process_registry import process_registry
+                result = process_registry.claim_completion_delivery(
+                    str(evt.get("session_id") or ""), evt.get("started_at"),
+                )
+                if result is False:
+                    return None
+                process_claimed = result is True
             if identity is not None:
                 if self._completion_identity_seen(identity, claim=True):
                     return None
@@ -1600,6 +1619,10 @@ class GatewayNotificationsMixin:
             if identity is not None:
                 with self._completion_delivery_lock:
                     self._mark_completions_delivered_locked((identity,))
+            if process_claimed and process_registry is not None:
+                process_registry.finish_completion_delivery(
+                    str(evt.get("session_id") or ""), evt.get("started_at"), delivered=True,
+                )
             return True
         except WakeNotAccepted:
             refused = True
@@ -1616,6 +1639,13 @@ class GatewayNotificationsMixin:
                     self._settle_durable_claim(operation, sibling["delegation_id"], claim_id)
             if accepted and sibling_claims:
                 self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
+            if process_claimed and not accepted:
+                try:
+                    process_registry.finish_completion_delivery(
+                        str(evt.get("session_id") or ""), evt.get("started_at"), delivered=False,
+                    )
+                except Exception:
+                    logger.debug("Could not release process completion claim", exc_info=True)
 
     @staticmethod
     def _event_route_key(evt: dict, fields: tuple[str, ...]) -> tuple[str, ...]:
@@ -1653,10 +1683,16 @@ class GatewayNotificationsMixin:
         return "\n".join(lines)
 
     def _record_coalesced_completion_siblings(self, events: list[dict]) -> None:
-        """Extend a successful primary delivery claim to its batched siblings."""
+        """Extend a successful primary delivery to batched sibling tombstones."""
         identities = [i for i in map(self._completion_delivery_identity, events) if i is not None]
         with self._completion_delivery_lock:
             self._mark_completions_delivered_locked(identities)
+        from tools.process_registry import process_registry
+        for evt in events:
+            if evt.get("type") == "completion":
+                process_registry.finish_completion_delivery(
+                    str(evt.get("session_id") or ""), evt.get("started_at"), delivered=True,
+                )
 
     async def _flush_process_completion_batch(self, key: tuple[str, ...]) -> None:
         """Deliver one short-window completion batch and resolve its waiters."""
@@ -2061,9 +2097,22 @@ class GatewayNotificationsMixin:
                       session_id, interval, notify_mode, agent_notify)
         silent = notify_mode == "off" and not agent_notify
         last_output_len = 0
+        event_waited_session = None
+        if agent_notify and hasattr(process_registry, "wait_for_completion"):
+            current_session = process_registry.get(session_id)
+            if current_session is not None and current_session.exited:
+                event_waited_session = current_session
+            else:
+                event_waited_session = await asyncio.to_thread(
+                    process_registry.wait_for_completion, session_id,
+                )
         while True:
-            await asyncio.sleep(interval)
-            session = process_registry.get(session_id)
+            if event_waited_session is not None:
+                session = event_waited_session
+                event_waited_session = None
+            else:
+                await asyncio.sleep(interval)
+                session = process_registry.get(session_id)
             if session is None:
                 break
             if silent:
@@ -2087,8 +2136,8 @@ class GatewayNotificationsMixin:
                     turn_busy = await self._launching_turn_active(platform_name, watcher)
                     delivered = await self._enqueue_process_completion_notification(synth_text, completion_evt)
                     if delivered is False:
-                        # The process remains terminal; retry after failed adapter injection instead
-                        # of suppressing the result.
+                        await asyncio.sleep(interval)
+                        event_waited_session = session
                         continue
                     # The agent normally reports the result itself, so the chat gets no separate receipt.
                     # While the launching turn is still running the injection only queues a follow-up, and

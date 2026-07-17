@@ -16,7 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _drain_gateway_watch_events
+from gateway.session import SessionSource
 from tools.process_registry import ProcessRegistry, ProcessSession
 
 
@@ -91,6 +92,32 @@ def _completion_event(*, started_at, session_id="proc_reused"):
         "completion_reason": "exited",
         "output": "done\n",
     }
+
+
+def _durable_process(registry, *, session_id="proc_durable", started_at=50.0):
+    session = ProcessSession(
+        id=session_id,
+        command="echo done",
+        session_key="profile:programmer:agent:main:discord:channel:origin-chat",
+        started_at=started_at,
+        exited=True,
+        exit_code=0,
+        output_buffer="done\n",
+        watcher_platform="discord",
+        watcher_chat_id="origin-chat",
+        watcher_thread_id="origin-thread",
+        watcher_user_id="origin-user",
+        parent_session_id="origin-session",
+        watcher_profile="programmer",
+        watcher_interval=5,
+        notify_on_complete=True,
+        notification_state="pending",
+        notification_completed_at=60.0,
+    )
+    session._completion_event.set()
+    registry._finished[session.id] = session
+    registry._write_checkpoint()
+    return session
 
 
 def _stop_after_sleeps(monkeypatch, runner, count):

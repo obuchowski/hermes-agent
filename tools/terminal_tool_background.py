@@ -56,6 +56,7 @@ _ASYNC_UNSUPPORTED_NOTE = (
 
 # proc_session attribute -> HERMES_SESSION_* env var carrying it.
 _ROUTING_FIELDS = (
+    ("watcher_chat_type", "HERMES_SESSION_CHAT_TYPE"),
     ("watcher_chat_id", "HERMES_SESSION_CHAT_ID"),
     ("watcher_user_id", "HERMES_SESSION_USER_ID"),
     ("watcher_user_name", "HERMES_SESSION_USER_NAME"),
@@ -65,6 +66,7 @@ _ROUTING_FIELDS = (
     # pre-flight drop the notification if the user closed this session (/new)
     # before the process finished, instead of injecting it into the NEW one.
     ("parent_session_id", "HERMES_SESSION_ID"),
+    ("watcher_profile", "HERMES_SESSION_PROFILE"),
 )
 
 
@@ -87,10 +89,10 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
-           session_key, effective_pty, persist_on_release: bool = False):
+           session_key, effective_pty, notification=None, persist_on_release: bool = False):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
-                  persist_on_release=persist_on_release)
+                  persist_on_release=persist_on_release, notification=notification)
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)
@@ -125,13 +127,7 @@ def _register_completion_watcher(process_registry, proc_session, session_key) ->
     serves, or while it stops, the descriptor waits in ``pending_watchers`` for the
     startup / post-turn drain instead."""
     proc_session.watcher_interval = 5
-    watcher = {
-        "session_id": proc_session.id, "check_interval": 5, "session_key": session_key,
-        "platform": proc_session.watcher_platform,
-        **{attr.removeprefix("watcher_"): getattr(proc_session, attr)
-           for attr, _ in _ROUTING_FIELDS[:-1]},
-        "notify_on_complete": True, "parent_session_id": proc_session.parent_session_id,
-    }
+    watcher = process_registry._watcher_for_session(proc_session)
     runner_ref = getattr(sys.modules.get("gateway.run"), "_gateway_runner_ref", None)
     runner = runner_ref() if callable(runner_ref) else None
     if runner is not None and runner.arm_process_watcher(watcher):
@@ -164,11 +160,37 @@ def spawn_background_process(
         mounted_host=mounted_host if mounted_host is not None else getattr(env, "host_cwd", None),
         env=env,
     )
+    notification_requested = bool(notify_on_complete or watch_patterns)
+    watch_patterns, conflict_note = _resolve_notification_flag_conflict(
+        notify_on_complete=bool(notify_on_complete), watch_patterns=watch_patterns, background=True,
+    )
+    notification = None
+    async_unsupported = False
+    if notify_on_complete or watch_patterns:
+        from gateway.session_context import async_delivery_supported, get_session_env
+        if not async_delivery_supported():
+            notify_on_complete, watch_patterns = False, None
+            async_unsupported = True
+        else:
+            notification = {
+                "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
+                "chat_type": get_session_env("HERMES_SESSION_CHAT_TYPE", ""),
+                "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
+                "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", ""),
+                "user_id": get_session_env("HERMES_SESSION_USER_ID", ""),
+                "user_name": get_session_env("HERMES_SESSION_USER_NAME", ""),
+                "message_id": get_session_env("HERMES_SESSION_MESSAGE_ID", ""),
+                "session_id": get_session_env("HERMES_SESSION_ID", ""),
+                "profile": get_session_env("HERMES_SESSION_PROFILE", ""),
+                "check_interval": 5 if get_session_env("HERMES_SESSION_PLATFORM", "") else 0,
+                "notify_on_complete": bool(notify_on_complete),
+                "watch_patterns": list(watch_patterns or []),
+            }
     try:
         proc_session = _spawn(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
-            effective_pty=effective_pty, persist_on_release=persist_on_release,
+            effective_pty=effective_pty, persist_on_release=persist_on_release, notification=notification,
         )
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
@@ -178,23 +200,19 @@ def spawn_background_process(
             result_data["approval"] = approval_note
         if pty_disabled_reason:
             result_data["pty_note"] = pty_disabled_reason
-        if not notify_on_complete and not watch_patterns:
+        if not notification_requested:
             result_data["hint"] = _SILENT_BACKGROUND_HINT
+        if async_unsupported:
+            result_data["notify_on_complete"] = False
+            result_data["notify_unsupported"] = _ASYNC_UNSUPPORTED_NOTE
         if command and _looks_like_homebrew_ci_poller(command):
             existing = result_data.get("hint", "")
             result_data["hint"] = (existing + "\n\n" + _HOMEBREW_CI_POLLER_HINT if existing
                                    else _HOMEBREW_CI_POLLER_HINT)
-
-        notify_on_complete, watch_patterns = _apply_async_support(
-            proc_session, result_data, notify_on_complete, watch_patterns)
-        watch_patterns, conflict_note = _resolve_notification_flag_conflict(
-            notify_on_complete=bool(notify_on_complete), watch_patterns=watch_patterns, background=True,
-        )
         if conflict_note:
             logger.warning("background proc %s: %s", proc_session.id, conflict_note)
             result_data["watch_patterns_ignored"] = conflict_note
         if notify_on_complete:
-            proc_session.notify_on_complete = True
             result_data["notify_on_complete"] = True
             if completion_output_chars:
                 proc_session.completion_output_chars = int(completion_output_chars)
@@ -211,7 +229,6 @@ def spawn_background_process(
         elif heartbeat_seconds:
             result_data["heartbeat_ignored"] = "heartbeat needs notify=true delivery, which this session cannot receive"
         if watch_patterns:
-            proc_session.watch_patterns = list(watch_patterns)
             result_data["watch_patterns"] = proc_session.watch_patterns
         return json.dumps(result_data, ensure_ascii=False)
     except Exception as e:
