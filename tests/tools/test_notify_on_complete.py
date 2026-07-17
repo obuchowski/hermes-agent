@@ -10,6 +10,7 @@ Covers:
 
 import json
 import os
+import subprocess
 import time
 import pytest
 from unittest.mock import MagicMock, patch
@@ -754,3 +755,160 @@ def test_non_ci_background_command_does_not_emit_homebrew_hint(monkeypatch, tmp_
     assert "hint" not in result, (
         f"Non-CI command using awk must not be flagged as homebrew CI poller, got: {result.get('hint')!r}"
     )
+
+
+def test_fast_completion_keeps_atomic_route_before_watcher_drain(monkeypatch, tmp_path):
+    """A command may exit before post-turn watcher registration is drained."""
+    import tools.process_registry as pr_module
+    import tools.terminal_tool as tt
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from types import SimpleNamespace
+
+    registry = ProcessRegistry()
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    monkeypatch.setattr(tt, "_get_env_config", lambda: _silent_bg_base_config(tmp_path))
+    monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(tt, "_check_all_guards", lambda *_a, **_kw: {"approved": True})
+    monkeypatch.setitem(tt._active_environments, "default", SimpleNamespace(env={}))
+    monkeypatch.setitem(tt._last_activity, "default", 0.0)
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="origin-chat",
+        thread_id="origin-thread",
+        user_id="origin-user",
+        session_key="profile:programmer:agent:main:discord:channel:origin-chat",
+        session_id="origin-session",
+        message_id="origin-message",
+        profile="programmer",
+    )
+    try:
+        result = json.loads(tt.terminal_tool(
+            command="printf done",
+            background=True,
+            notify_on_complete=True,
+        ))
+        session = registry.wait_for_completion(result["session_id"])
+    finally:
+        clear_session_vars(tokens)
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert session is not None and session.exited
+    assert session.notification_state == "pending"
+    assert session.watcher_platform == "discord"
+    assert session.watcher_profile == "programmer"
+    assert session.watcher_thread_id == "origin-thread"
+    assert registry.pending_watchers[0]["session_id"] == session.id
+    assert registry.pending_watchers[0]["parent_session_id"] == "origin-session"
+    checkpoint = json.loads((tmp_path / "processes.json").read_text())
+    assert checkpoint[0]["launch_state"] == "running"
+    assert checkpoint[0]["notification_state"] == "pending"
+    assert checkpoint[0]["watcher_profile"] == "programmer"
+
+
+def test_restart_while_process_running_recovers_event_driven_completion(monkeypatch, tmp_path):
+    """A restarted registry keeps the route and observes exit via pidfd."""
+    import tools.process_registry as pr_module
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+    proc = subprocess.Popen(["sleep", "0.15"], start_new_session=True)
+    original = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_restart_live",
+        command="sleep 0.15",
+        pid=proc.pid,
+        host_start_time=original._safe_host_start_time(proc.pid),
+        started_at=time.time(),
+        session_key="profile:programmer:agent:main:discord:channel:origin-chat",
+        watcher_platform="discord",
+        watcher_chat_id="origin-chat",
+        watcher_thread_id="origin-thread",
+        watcher_profile="programmer",
+        watcher_interval=5,
+        notify_on_complete=True,
+        notification_state="pending",
+    )
+    original._running[session.id] = session
+    original._write_checkpoint()
+
+    recovered = ProcessRegistry()
+    assert recovered.recover_from_checkpoint() == 1
+    recovered_session = recovered.wait_for_completion(session.id)
+    proc.wait(timeout=2)
+
+    assert recovered_session is not None and recovered_session.exited
+    assert recovered_session.notification_state == "pending"
+    assert recovered.pending_watchers[0]["profile"] == "programmer"
+
+
+def test_prepared_launch_checkpoint_never_delivers_completion(monkeypatch, tmp_path):
+    """A crash before launch confirmation must not look like process exit."""
+    import tools.process_registry as pr_module
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+    checkpoint.write_text(json.dumps([{
+        "session_id": "proc_prepared_only",
+        "command": "never spawned",
+        "pid": None,
+        "pid_scope": "host",
+        "started_at": time.time(),
+        "launch_state": "prepared",
+        "notify_on_complete": True,
+        "notification_state": "pending",
+        "watcher_platform": "discord",
+        "watcher_chat_id": "origin-chat",
+        "watcher_interval": 5,
+        "exited": False,
+    }]))
+
+    recovered = ProcessRegistry()
+    assert recovered.recover_from_checkpoint() == 0
+    assert recovered.get("proc_prepared_only") is None
+    assert recovered.pending_watchers == []
+    assert json.loads(checkpoint.read_text()) == []
+
+
+@pytest.mark.parametrize("notification_state", ["pending", "delivering"])
+def test_completed_non_host_notification_recovers_before_pid_scope_gate(
+    monkeypatch, tmp_path, notification_state,
+):
+    """Exited sandbox records remain deliverable after the environment is gone."""
+    import tools.process_registry as pr_module
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+    checkpoint.write_text(json.dumps([{
+        "session_id": "proc_sandbox_complete",
+        "command": "sandbox task",
+        "pid": 123,
+        "pid_scope": "sandbox",
+        "started_at": time.time(),
+        "launch_state": "running",
+        "notify_on_complete": True,
+        "notification_state": notification_state,
+        "watcher_platform": "discord",
+        "watcher_chat_id": "origin-chat",
+        "watcher_interval": 5,
+        "exited": True,
+        "exit_code": 0,
+        "output_buffer": "done",
+    }]))
+
+    recovered = ProcessRegistry()
+    assert recovered.recover_from_checkpoint() == 1
+    session = recovered.get("proc_sandbox_complete")
+    assert session is not None and session.exited
+    assert session.pid_scope == "sandbox"
+    assert session.notification_state == "pending"
+    assert recovered.pending_watchers[0]["session_id"] == session.id
+
+
+def test_notify_false_has_no_durable_delivery_state(registry):
+    session = _make_session(exited=True, exit_code=0, notify_on_complete=False)
+    registry._finished[session.id] = session
+
+    assert registry.claim_completion_delivery(session.id, session.started_at) is False
+    assert session.notification_state == "none"
