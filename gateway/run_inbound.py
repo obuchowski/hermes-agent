@@ -598,6 +598,21 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         _evt_cmd = event.get_command()
         _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
+        if _evt_cmd and _cmd_def_inner is None:
+            try:
+                from hermes_cli.plugins import get_plugin_command
+                normalized = _evt_cmd.replace("_", "-")
+                if get_plugin_command(normalized) is not None:
+                    denied = self._check_slash_access(source, normalized)
+                    if denied is not None:
+                        return True, denied
+                    return True, (
+                        f"⏳ Agent is running — `/{normalized}` can't run mid-turn. "
+                        "Wait for the current response or `/stop` first."
+                    )
+            except Exception:
+                pass
+
         if _cmd_def_inner:
             # /status and /context are intentionally pre-gate so users always see session state.
             if _cmd_def_inner.name == "status":
@@ -1080,8 +1095,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         # underscored autocomplete form matches plugin commands registered with hyphens.
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
+                from hermes_cli.plugins import get_plugin_command, get_plugin_command_handler
+                normalized = command.replace("_", "-")
+                plugin_command = get_plugin_command(normalized)
+                plugin_handler = (plugin_command or {}).get("handler") or get_plugin_command_handler(normalized)
                 if plugin_handler:
                     # The agent-turn path binds HERMES_SESSION_* via _set_session_env; this dispatch
                     # sits before it, so a handler reading get_session_env() would see an empty or a
@@ -1092,16 +1109,21 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                     _plugin_context = build_session_context(source, self.config)
                     _plugin_context.session_key = self._session_key_for_source(source)
                     user_args = event.get_command_args().strip()
+                    handler_args = (user_args,)
+                    if plugin_command and plugin_command.get("gateway_context"):
+                        context = await self._plugin_gateway_command_context(source)
+                        handler_args += (context,)
                     with self._session_env_scope(_plugin_context):
                         if asyncio.iscoroutinefunction(plugin_handler):
-                            result = await plugin_handler(user_args)
+                            result = await plugin_handler(*handler_args)
                         else:
-                            result = await self._run_in_executor_with_context(plugin_handler, user_args)
+                            result = await self._run_in_executor_with_context(plugin_handler, *handler_args)
                             if asyncio.iscoroutine(result):
                                 result = await result
                     return True, str(result) if result else None, command
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
+                return True, f"Plugin command failed: {e}", command
         return False, None, command
 
     def _hm_bundle_slash_rewrite(

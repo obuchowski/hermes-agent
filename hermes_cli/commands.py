@@ -546,6 +546,10 @@ def gateway_help_lines(allowed: Optional[Iterable[str]] = None) -> list[str]:
                        if not (a.replace("-", "_") == cmd.name.replace("-", "_") and a != cmd.name)]
         alias_note = t("slash.shared.alias_note", aliases=", ".join(alias_parts)) if alias_parts else ""
         lines.append(f"`/{cmd.name}{args}` -- {cmd.describe()}{alias_note}")
+    for name, description, args_hint in _iter_plugin_command_entries():
+        args = f" {args_hint}" if args_hint else ""
+        lines.append(f"`/{name}{args}` -- {description}")
+
     return lines
 
 

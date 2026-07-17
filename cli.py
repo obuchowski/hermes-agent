@@ -1273,9 +1273,14 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         return True
 
     def _run_plugin_slash_command(self, base_cmd: str, user_args: str) -> None:
-        from hermes_cli.plugins import get_plugin_command_handler, resolve_plugin_command_result
+        from hermes_cli.plugins import get_plugin_command, get_plugin_command_handler, resolve_plugin_command_result
 
-        plugin_handler = get_plugin_command_handler(base_cmd.lstrip("/"))
+        command_name = base_cmd.lstrip("/")
+        plugin_command = get_plugin_command(command_name) or {}
+        if plugin_command.get("gateway_context"):
+            _cprint("This plugin command is available only in an authenticated gateway session.")
+            return
+        plugin_handler = get_plugin_command_handler(command_name)
         if not plugin_handler:
             return
         try:

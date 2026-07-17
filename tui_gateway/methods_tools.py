@@ -678,6 +678,10 @@ def _is_registry_command(base: str) -> bool:
 
 
 def _dispatch_plugin(rid, params, session, name, arg):
+    plugins = _tools_mod("hermes_cli.plugins")
+    plugin_command = plugins.get_plugin_command(name)
+    if plugin_command and plugin_command.get("gateway_context"):
+        return _err(rid, 4019, f"gateway-context plugin command: use a messaging gateway for /{name}")
     if handler := _plugin_command_handler(name):
         with contextlib.suppress(Exception):
             return _ok(rid, {"type": "plugin", "output": _run_plugin_command(handler, arg, session)})

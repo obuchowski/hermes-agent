@@ -24,6 +24,26 @@ from gateway.session_transcript import SessionTranscriptMixin
 logger = logging.getLogger(__name__)
 
 
+def canonicalize_session_cwd(raw_cwd: str, *, current_cwd: str = "") -> str:
+    """Validate and canonicalize a requested session workspace."""
+    raw = str(raw_cwd or "").strip()
+    if not raw:
+        raise ValueError("Usage: /programming <cwd>")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        base = Path(str(current_cwd or "").strip()).expanduser()
+        if not base.is_absolute() or not base.is_dir():
+            raise ValueError("Relative cwd requires an existing durable cwd on the current session.")
+        candidate = base / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Workspace does not exist: {candidate}") from exc
+    if not resolved.is_dir():
+        raise ValueError(f"Workspace is not a directory: {resolved}")
+    return str(resolved)
+
+
 # -- PII redaction helpers --------------------------------------------------------------------
 
 def _hash_id(value: str) -> str:
@@ -804,6 +824,7 @@ class SessionStore(
         self._fast_persisted_entries: Dict[str, tuple[int, str]] = {}
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
+        self._route_transition_locks: Dict[str, threading.Lock] = {}
         # An unscoped legacy Slack key is claimed once per process (two workspaces must not both
         # revive one session).
         self._legacy_slack_claim_lock = threading.Lock()
@@ -917,9 +938,10 @@ class SessionStore(
             return slot.result
 
         try:
-            slot.result = self._get_or_create_session_impl(
-                source, force_new=force_new, touch_activity=touch_activity,
-            )
+            with self._route_transition_lock(session_key):
+                slot.result = self._get_or_create_session_impl(
+                    source, force_new=force_new, touch_activity=touch_activity,
+                )
             return slot.result
         except BaseException as exc:
             slot.error = exc
@@ -928,6 +950,15 @@ class SessionStore(
             slot.event.set()
             with inflight_lock:
                 self._inflight_sessions.pop(session_key, None)
+
+    def _route_transition_lock(self, session_key: str) -> threading.Lock:
+        """Return the per-route lock shared by explicit and implicit creation."""
+        with self._inflight_lock:
+            lock = self._route_transition_locks.get(session_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._route_transition_locks[session_key] = lock
+            return lock
 
     def _get_or_create_session_impl(
         self, source: SessionSource, force_new: bool = False, touch_activity: bool = True,
@@ -1243,6 +1274,49 @@ class SessionStore(
     # Compression repoint is store bookkeeping, not user activity — leave ``updated_at`` alone so a
     # background compression on an idle session cannot make it look fresh to the
     # restart-resume freshness gate (#85709).
+    def create_and_activate_fresh_session(
+        self, source: SessionSource, *, cwd: str, profile_name: str,
+    ) -> SessionEntry:
+        """Atomically create an empty durable session and bind this route to it."""
+        if self._db is None:
+            raise RuntimeError("durable session storage is unavailable")
+        if not cwd or not Path(cwd).is_absolute():
+            raise ValueError("cwd must be an absolute path")
+        if not profile_name:
+            raise ValueError("profile_name is required")
+
+        session_key = self._generate_session_key(source)
+        now = _now()
+        session_id = _new_session_id(now)
+        candidate = SessionEntry(
+            session_key=session_key, session_id=session_id, created_at=now, updated_at=now,
+            origin=source, display_name=source.chat_name, platform=source.platform,
+            chat_type=source.chat_type, is_fresh_reset=True,
+        )
+        with self._route_transition_lock(session_key):
+            with self._lock:
+                self._ensure_loaded_locked()
+            self._db.create_gateway_session_and_activate(
+                session_id=session_id, source=source.platform.value, user_id=source.user_id,
+                session_key=session_key, chat_id=source.chat_id, chat_type=source.chat_type,
+                thread_id=source.thread_id, cwd=cwd, profile_name=profile_name,
+                entry_json=json.dumps(candidate.to_dict()), routing_scope=self._routing_scope(),
+            )
+            with self._lock:
+                self._entries[session_key] = candidate
+                self._routing_generation += 1
+                self._persisted_routing_generation = self._routing_generation
+                mirror = {key: entry.to_dict() for key, entry in self._entries.items()}
+        if self._write_sessions_json:
+            try:
+                self._save_sessions_json(mirror)
+            except Exception:
+                logger.warning(
+                    "gateway.session: fresh-session route committed but legacy sessions.json mirror update failed",
+                    exc_info=True,
+                )
+        return candidate
+
     def switch_session(
         self, session_key: str, target_session_id: str, *, expected_session_id: Optional[str] = None,
         preserve_prompt_pin: bool = True,

@@ -26,7 +26,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
 
 from hermes_constants import get_hermes_home, get_process_hermes_home, hermes_home_key
 from registration_lifecycle import replacement_coordinator
@@ -209,6 +209,36 @@ SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification"}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 _UNSET = object()
+
+
+@dataclass(frozen=True)
+class FreshSessionRequest:
+    """Typed request for a fresh gateway session rooted at ``cwd``."""
+    cwd: str
+
+
+@dataclass(frozen=True)
+class FreshSessionResult:
+    """Durable identity returned after a fresh session route is activated."""
+    session_id: str
+    cwd: str
+    profile_name: str
+
+
+@dataclass(frozen=True)
+class PluginCommandContext:
+    """Authenticated session facts and narrow gateway lifecycle capabilities."""
+    effective_profile_name: str
+    session_id: str = ""
+    cwd: str = ""
+    _fresh_session_factory: Optional[
+        Callable[[FreshSessionRequest], Awaitable[FreshSessionResult]]
+    ] = field(default=None, repr=False, compare=False)
+
+    async def create_fresh_session(self, request: FreshSessionRequest) -> FreshSessionResult:
+        if self._fresh_session_factory is None:
+            raise RuntimeError("Fresh session activation is unavailable on this surface.")
+        return await self._fresh_session_factory(request)
 
 
 @dataclass
@@ -646,11 +676,13 @@ class PluginContext:
     @_serialized_replacement
     def register_command(
         self, name: str, handler: Callable, description: str = "", args_hint: str = "",
-        argument_mode: str | None = None,
+        argument_mode: str | None = None, gateway_context: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register an in-session slash command (``/name``); handler ``fn(raw_args: str) -> str | None``
-        (sync or async). ``args_hint`` (e.g. ``"<file>"``) lets adapters like Discord surface an argument
-        field; without it the command registers parameterless there but still accepts trailing text."""
+        (sync or async). With ``gateway_context=True`` it instead receives
+        ``fn(raw_args, PluginCommandContext)`` and is unavailable on local surfaces.
+        ``args_hint`` (e.g. ``"<file>"``) lets adapters like Discord surface an argument field;
+        without it the command registers parameterless there but still accepts trailing text."""
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
             logger.warning("Plugin '%s' tried to register a command with an empty name.", self.manifest.name)
@@ -667,6 +699,7 @@ class PluginContext:
             "plugin": self.manifest.name, "plugin_key": self.plugin_id, "args_hint": hint,
             "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
             else ("text" if hint else None),
+            "gateway_context": bool(gateway_context),
         }
         return self._register_entry("command", clean, self._manager._plugin_commands, entry,
                                     "Plugin %s registered command: /%s", clean)

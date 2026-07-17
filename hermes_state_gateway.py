@@ -307,6 +307,35 @@ class SessionGatewayMixin:
             (scope, session_key, entry_json, time.time()),
         )
 
+    def create_gateway_session_and_activate(
+        self, *, session_id: str, source: str, session_key: str, entry_json: str,
+        cwd: str, profile_name: str, routing_scope: str = "", user_id: str = None,
+        chat_id: str = None, chat_type: str = None, thread_id: str = None,
+    ) -> None:
+        """Atomically insert a fresh session row and activate its gateway route."""
+        if not session_id or not session_key or not entry_json or not cwd:
+            raise ValueError("fresh gateway session requires id, route, entry, and cwd")
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                   cwd, profile_name, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                 cwd, profile_name, time.time()),
+            )
+            conn.execute(
+                """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(scope, session_key) DO UPDATE SET
+                       entry_json = excluded.entry_json,
+                       updated_at = excluded.updated_at""",
+                (routing_scope, session_key, entry_json, time.time()),
+            )
+
+        self._execute_write(_do)
+
     def replace_gateway_routing_entries(self, entries: Dict[str, str], *, scope: str = "") -> None:
         """Atomically replace the routing index for *scope* (keys absent from *entries*
         are removed); other scopes untouched."""
