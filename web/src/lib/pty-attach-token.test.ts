@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * one origin do.
  */
 type Tab = {
-  ptyAttachToken: (rotate?: boolean) => Promise<string>;
+  ptyAttachToken: (rotate?: boolean, scope?: string) => Promise<string>;
   storage: Storage;
 };
 
@@ -91,6 +91,16 @@ afterEach(() => {
 });
 
 describe("ptyAttachToken", () => {
+  it("isolates profile/session scopes and rotates only the selected scope", async () => {
+    const tab = await openTab(new Set<string>());
+    const a = await tab.ptyAttachToken(false, "programmer\0a");
+    const b = await tab.ptyAttachToken(false, "programmer\0b");
+    const other = await tab.ptyAttachToken(false, "default\0a");
+    expect(new Set([a, b, other]).size).toBe(3);
+    expect(await tab.ptyAttachToken(false, "programmer\0a")).toBe(a);
+    expect(await tab.ptyAttachToken(true, "programmer\0a")).not.toBe(a);
+    expect(await tab.ptyAttachToken(false, "programmer\0b")).toBe(b);
+  });
   it("mints its own token for a duplicate tab instead of sharing the live one", async () => {
     const held = new Set<string>();
     const first = await openTab(held);

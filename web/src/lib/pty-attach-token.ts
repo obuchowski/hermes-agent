@@ -16,7 +16,7 @@ const PTY_ATTACH_TOKEN_KEY = "hermes.pty.token.chat";
 
 /** The token this document claimed — a reconnect must not re-request the lock
  *  (Web Locks are not reentrant, so asking twice in one document deadlocks). */
-let claimedToken: string | null = null;
+const claimedTokens = new Map<string, string>();
 
 function tabStorage(): Storage | null {
   try {
@@ -57,20 +57,29 @@ async function claim(token: string): Promise<boolean> {
  * old keep-alive PTY must NOT be reattached) or when another live tab already
  * claimed the stored one.
  */
-export async function ptyAttachToken(rotate = false): Promise<string> {
+export function ptyAttachScope(
+  profile: string | null | undefined,
+  resume: string | null | undefined,
+): string {
+  return `${profile ?? ""}\0${resume ?? ""}`;
+}
+
+export async function ptyAttachToken(rotate = false, scope = ""): Promise<string> {
+  const key = scope ? `${PTY_ATTACH_TOKEN_KEY}:${encodeURIComponent(scope)}` : PTY_ATTACH_TOKEN_KEY;
+  const claimedToken = claimedTokens.get(scope);
   const stored =
-    claimedToken ?? tabStorage()?.getItem(PTY_ATTACH_TOKEN_KEY) ?? "";
+    claimedToken ?? tabStorage()?.getItem(key) ?? "";
   if (!rotate && stored && (stored === claimedToken || (await claim(stored)))) {
-    claimedToken = stored;
+    claimedTokens.set(scope, stored);
     return stored;
   }
   const token = mint();
   try {
-    tabStorage()?.setItem(PTY_ATTACH_TOKEN_KEY, token);
+    tabStorage()?.setItem(key, token);
   } catch {
     /* ignore */
   }
   await claim(token);
-  claimedToken = token;
+  claimedTokens.set(scope, token);
   return token;
 }

@@ -3,6 +3,7 @@ import json
 import pytest
 
 from hermes_cli import web_server
+import hermes_cli.web_routers.chat_ws as _chat_ws
 import hermes_cli.web_server_chat as _web_server_chat
 
 
@@ -29,6 +30,46 @@ class FakeBridge:
 
     def close(self):
         self.alive = False
+
+
+@pytest.mark.asyncio
+async def test_snapshot_disconnect_ends_attach_without_asgi_error():
+    from starlette.websockets import WebSocketDisconnect
+
+    class DisconnectedSession:
+        async def attach(self, ws, *, force_redraw=False):
+            raise WebSocketDisconnect(code=1006)
+
+    attached = await _chat_ws._attach_pty_session(
+        DisconnectedSession(), object(), force_redraw=False
+    )
+
+    assert attached is False
+
+
+@pytest.mark.asyncio
+async def test_snapshot_disconnected_state_runtime_error_ends_attach_cleanly():
+    class DisconnectedSession:
+        async def attach(self, ws, *, force_redraw=False):
+            raise RuntimeError('Cannot call "send" once a close message has been sent.')
+
+    attached = await _chat_ws._attach_pty_session(
+        DisconnectedSession(), object(), force_redraw=True
+    )
+
+    assert attached is False
+
+
+@pytest.mark.asyncio
+async def test_snapshot_attach_does_not_swallow_unrelated_failure():
+    class BrokenSession:
+        async def attach(self, ws, *, force_redraw=False):
+            raise RuntimeError("unexpected attach failure")
+
+    with pytest.raises(RuntimeError, match="unexpected attach failure"):
+        await _chat_ws._attach_pty_session(
+            BrokenSession(), object(), force_redraw=False
+        )
 
 
 @pytest.fixture

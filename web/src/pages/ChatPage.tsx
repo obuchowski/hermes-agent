@@ -42,6 +42,7 @@ import { copyTextToClipboard } from "@/lib/clipboard";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { createPtyCompositionForwarder } from "@/lib/pty-composition";
 import { shouldRestoreTerminalFocus } from "@/lib/pty-focus";
+import { ptyAttachScope, ptyAttachToken } from "@/lib/pty-attach-token";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
 import {
   PTY_CONNECTING_TIMEOUT_MS,
@@ -92,7 +93,6 @@ import {
   ptyRejectionBanner,
   type PtyBannerAction,
 } from "@/lib/pty-close-copy";
-import { ptyAttachToken } from "@/lib/pty-attach-token";
 import {
   refitWhenTerminalFontLoads,
   TERMINAL_FONT_FAMILY,
@@ -353,6 +353,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setWorkspaceProfile(scopedProfile);
     setWorkspaceCwdState(readStoredWorkspace(scopedProfile));
   }
+
+  const attachScope = ptyAttachScope(scopedProfile, resumeParam);
   const channel = useMemo(
     () => generateChannelId(`${resumeParam ?? ""}\0${scopedProfile}`),
     [resumeParam, scopedProfile],
@@ -1200,10 +1202,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // keeps its own cwd); the server validates the directory exists.
       const pickedWorkspace = resumeParam ? "" : readStoredWorkspace(scopedProfile);
       if (pickedWorkspace) params.cwd = pickedWorkspace;
-      // Keep-alive identity: reattach to this tab's living PTY across
-      // refresh/transient drops. A forced-fresh start rotates the token so
-      // the previous keep-alive PTY is not reattached (registry reaps it).
-      params.attach = await ptyAttachToken(forceFresh);
+      // Keep-alive identity is scoped to this browser tab + profile + resume
+      // target. Session switches must not reattach a different session's PTY.
+      // A forced-fresh start rotates only the current scope's token.
+      params.attach = await ptyAttachToken(forceFresh, attachScope);
       // Profile-scoped chat: the PTY child gets HERMES_HOME pointed at the
       // selected profile, so the conversation runs with that profile's model,
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
@@ -1602,6 +1604,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     };
   }, [
     hasActivated,
+    attachScope,
     channel,
     clearReconnectTimer,
     resumeParam,

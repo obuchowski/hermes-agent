@@ -80,6 +80,9 @@ class PtySession:
         self._attach_generation = 0
         self._drain_task: Optional[asyncio.Task] = None
         self._write_lock = asyncio.Lock()
+        # Serializes snapshot replay with live PTY output so a new socket sees
+        # one ordered byte stream rather than concurrent send_bytes() calls.
+        self._stream_lock = asyncio.Lock()
 
     async def start(self) -> None:
         self._drain_task = asyncio.create_task(self._drain())
@@ -89,22 +92,24 @@ class PtySession:
         while True:
             chunk = await loop.run_in_executor(None, self.bridge.read, self._read_timeout)
             if chunk is None:                       # EOF — the agent process exited
-                self.alive = False
-                await _close_ws(self._ws, WS_CLOSE_PROCESS_EXITED)
+                async with self._stream_lock:
+                    self.alive = False
+                    await _close_ws(self._ws, WS_CLOSE_PROCESS_EXITED)
                 return
             if not chunk:                            # idle tick
                 await asyncio.sleep(0)
                 continue
-            self.buffer.append(chunk)
-            ws = self._ws
-            try:
-                if ws is not None:
-                    await ws.send_bytes(chunk)
-            except Exception:
-                # The viewer is gone; nothing else observes this failure (the handler's finally
-                # only runs once ws.receive() sees the disconnect). detach() is a no-op when a
-                # replacement socket attached during the send, so the new viewer keeps its session.
-                self.detach(ws)
+            async with self._stream_lock:
+                self.buffer.append(chunk)
+                ws = self._ws
+                try:
+                    if ws is not None:
+                        await ws.send_bytes(chunk)
+                except Exception:
+                    # The viewer is gone; nothing else observes this failure (the handler's finally
+                    # only runs once ws.receive() sees the disconnect). detach() is a no-op when a
+                    # replacement socket attached during the send, so the new viewer keeps its session.
+                    self.detach(ws)
 
     async def write(self, ws, data: bytes) -> bool:
         """Serialize input and discard bytes from a superseded socket."""
@@ -130,23 +135,29 @@ class PtySession:
         The TUI renders differentially on an alternate screen, so a bounded ANSI tail is not a
         self-contained frame; ``force_redraw`` asks the live TUI for one full redraw after replay.
         """
-        if self._ws is not ws:
-            await _close_ws(self._ws, WS_CLOSE_SUPERSEDED)
-        self._ws = ws
-        self._attach_generation += 1
-        self.attached = True
-        self.last_detached_at = None
-        if snap := self.buffer.snapshot():
+        async with self._stream_lock:
+            if self._ws is not ws:
+                await _close_ws(self._ws, WS_CLOSE_SUPERSEDED)
+            self._ws = ws
+            self._attach_generation += 1
+            self.attached = True
+            self.last_detached_at = None
             try:
-                await ws.send_bytes(snap)
+                if snap := self.buffer.snapshot():
+                    await ws.send_bytes(snap)
+                if force_redraw:
+                    return await self.write(ws, TUI_FORCE_REDRAW)
+                return True
+            except asyncio.CancelledError:
+                # Snapshot replay happens before the route's receive loop.
+                # Roll back atomically so a later reconnect can attach.
+                self._ws = None
+                self.attached = False
+                self.last_detached_at = time.monotonic()
+                raise
             except Exception:
-                # Client dropped mid-replay; the caller never reaches its writer loop, so undo the
-                # attach here or reap_idle() can never reclaim this PTY (#110849).
                 self.detach(ws)
                 return False
-        if force_redraw:
-            return await self.write(ws, TUI_FORCE_REDRAW)
-        return True
 
     def detach(self, ws) -> None:
         # Only the currently-attached socket may mark the session detached: a superseded socket's

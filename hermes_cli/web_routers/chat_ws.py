@@ -535,6 +535,19 @@ async def _pty_channel_marker_state(
     return active_session_file, marker_preexisting, resume
 
 
+async def _attach_pty_session(session: Any, ws: WebSocket, *, force_redraw: bool) -> bool:
+    """Attach a keep-alive PTY, treating a mid-replay disconnect as normal."""
+    try:
+        return await session.attach(ws, force_redraw=force_redraw)
+    except WebSocketDisconnect:
+        return False
+    except RuntimeError as exc:
+        if str(exc) == 'Cannot call "send" once a close message has been sent.':
+            return False
+        raise
+
+
+
 @router.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     from hermes_cli.web_server_chat import PTY_REGISTRY, PtyBridge, PtyUnavailableError, _PTY_BRIDGE_AVAILABLE, _RESIZE_RE
@@ -669,7 +682,8 @@ async def pty_ws(ws: WebSocket) -> None:
 
     # A fresh xterm can't rebuild the TUI from an arbitrary tail of alternate-
     # screen differential output; reused PTYs emit a full frame after replay.
-    if not await session.attach(ws, force_redraw=not _created):
+    attached = await _attach_pty_session(session, ws, force_redraw=not _created)
+    if not attached:
         # attach() detaches itself when the client dropped mid-replay, and a socket
         # superseded during replay is already closed by its replacement; only a
         # stalled redraw write leaves THIS socket attached and worth closing.
