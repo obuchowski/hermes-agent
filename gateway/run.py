@@ -11466,6 +11466,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
+
+        # A CLI/TUI -> gateway handoff preserves the durable session id and its
+        # cwd in state.db.  Hydrate that exact row before binding runtime state,
+        # building/restoring any system prompt, or constructing/reusing an
+        # agent.  This keeps project instructions and all cwd-aware tools on the
+        # handed-off workspace without touching process-global cwd/env state.
+        await self._restore_session_workspace(context)
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -11830,9 +11837,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_agent._end_session_on_close = False
                                     _hyg_agent._print_fn = lambda *a, **kw: None
 
+                                    # Keep the existing loop-owned executor for
+                                    # this short-lived helper, but explicitly
+                                    # carry the gateway task context into it so
+                                    # the compression prompt rebuild sees the
+                                    # restored session cwd.
                                     loop = asyncio.get_running_loop()
+                                    _hyg_ctx = copy_context()
                                     _compressed, _ = await loop.run_in_executor(
                                         None,
+                                        _hyg_ctx.run,
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
@@ -15613,6 +15627,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
+    async def _restore_session_workspace(self, context: SessionContext) -> str:
+        """Hydrate the exact durable session cwd before binding agent state."""
+        session_row = None
+        session_id = str(getattr(context, "session_id", "") or "").strip()
+        if self._session_db is not None and session_id:
+            # A lookup error is not equivalent to a missing row. Propagate it
+            # before touching the known-good context/tool cwd so this turn
+            # cannot build a prompt against the gateway process workspace.
+            session_row = await self._session_db.get_session(session_id)
+        from gateway.session_context import (
+            restore_session_workspace,
+            session_workspace_candidate,
+        )
+
+        # Path.is_dir() can perform blocking filesystem metadata I/O. Keep the
+        # validation pure and off-loop, then apply its result on this task.
+        candidate = session_workspace_candidate(session_id, session_row)
+        is_valid = bool(
+            candidate is not None
+            and await asyncio.to_thread(candidate.is_dir)
+        )
+        validated_cwd = str(candidate) if is_valid else ""
+        return restore_session_workspace(
+            context,
+            session_row,
+            validated_cwd=validated_cwd,
+        )
+
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
 
@@ -15641,8 +15683,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=getattr(context, "cwd", "") or "",
             async_delivery=_async_delivery,
         )
 
@@ -18995,6 +19039,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
+            from agent.runtime_cwd import resolve_context_cwd
+            _session_cwd_cache_key = str(resolve_context_cwd() or "")
+
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
@@ -19003,7 +19050,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
-                cache_keys=self._extract_cache_busting_config(user_config),
+                cache_keys={
+                    **self._extract_cache_busting_config(user_config),
+                    # Workspace changes are conversation-boundary changes. They
+                    # must rebuild a cached agent once so its frozen system
+                    # prompt discovers the new AGENTS.md, while remaining stable
+                    # on every subsequent turn for prompt-prefix cache hits.
+                    "session_cwd": _session_cwd_cache_key,
+                },
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
             )

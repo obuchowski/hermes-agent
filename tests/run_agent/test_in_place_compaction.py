@@ -47,8 +47,10 @@ def _make_agent(session_db, session_id, *, in_place):
     return agent
 
 
-def _seed(db, sid, title, n=8):
-    db.create_session(sid, "cli", model="test/model")
+def _seed(db, sid, title, n=8, *, profile_name=None):
+    db.create_session(
+        sid, "cli", model="test/model", profile_name=profile_name
+    )
     db.set_session_title(sid, title)
     for i in range(n):
         db.append_message(
@@ -141,6 +143,37 @@ class TestInPlaceCompaction:
             roles = [m["role"] for m in compressed if m.get("role") != "system"]
             assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1))
 
+    def test_in_place_prompt_rebuild_keeps_workspace_agents_md(self, tmp_path):
+        """Compression rebuilds the prompt inside the restored cwd context."""
+        from agent.conversation_compression import compress_context
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from hermes_state import SessionDB
+        from tools.terminal_tool import clear_task_env_overrides
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "AGENTS.md").write_text("KEEP THIS WORKSPACE RULE")
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "in-place-workspace"
+        db.create_session(sid, "discord", cwd=str(workspace))
+        agent = _make_agent(db, sid, in_place=True)
+        agent.skip_context_files = False
+
+        tokens = set_session_vars(session_id=sid, cwd=str(workspace))
+        try:
+            _, rebuilt_prompt = compress_context(
+                agent,
+                [{"role": "user", "content": f"m{i}"} for i in range(8)],
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+        finally:
+            clear_session_vars(tokens)
+            clear_task_env_overrides(sid)
+            db.close()
+
+        assert "KEEP THIS WORKSPACE RULE" in rebuilt_prompt
+
     def test_in_place_skips_redundant_preflush(self):
         """In-place must NOT pre-flush current-turn messages: replace_messages
         rewrites the whole row, so a flush would INSERT rows it immediately
@@ -195,7 +228,10 @@ class TestRotationFallbackWhenFlagOff:
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
             sid = "20260619_130000_bbbbbb"
-            _seed(db, sid, "my-research")
+            _seed(db, sid, "my-research", profile_name="programmer")
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            db.update_session_cwd(sid, str(workspace))
             agent = _make_agent(db, sid, in_place=False)
             agent._last_flushed_db_idx = 5
 
@@ -213,10 +249,54 @@ class TestRotationFallbackWhenFlagOff:
             ).fetchall()
             assert len(child) == 1
             assert child[0]["title"] == "my-research #2"
+            child_row = db.get_session(agent.session_id)
+            assert child_row["cwd"] == str(workspace)
+            assert child_row["profile_name"] == "programmer"
+            from hermes_cli.session_resolution import resolve_profile_session
+
+            resolved = resolve_profile_session(
+                agent.session_id,
+                active_profile="programmer",
+                local_db=db,
+                root_db=db,
+            )
+            assert resolved is not None
+            assert resolved.session_id == agent.session_id
             # Flush cursor reset for the new row.
             assert agent._last_flushed_db_idx == 0
             # Rotation mode does NOT set the in-place signal.
             assert getattr(agent, "_last_compaction_in_place", False) is False
+
+    def test_rotation_parent_lookup_error_does_not_end_or_fork(self):
+        """A transient parent read failure must leave its durable identity intact."""
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "rotation-read-error"
+            _seed(db, sid, "keep-parent", profile_name="programmer")
+            agent = _make_agent(db, sid, in_place=False)
+
+            with patch.object(
+                db,
+                "get_session",
+                side_effect=RuntimeError("sqlite temporarily unavailable"),
+            ):
+                compress_context(
+                    agent,
+                    [{"role": "user", "content": "x"}] * 8,
+                    approx_tokens=100_000,
+                    system_message="sys",
+                )
+
+            assert agent.session_id == sid
+            parent = db.get_session(sid)
+            assert parent["end_reason"] is None
+            assert parent["profile_name"] == "programmer"
+            assert db._conn.execute(
+                "SELECT 1 FROM sessions WHERE parent_session_id = ?", (sid,)
+            ).fetchall() == []
 
 
 class TestInPlaceSignalForGateway:
@@ -317,4 +397,3 @@ class TestCompactedTurnsStaySearchable:
                 "ZEBRAWORD", role_filter=["user", "assistant"], include_inactive=True
             )
             assert len(recovered) == 1
-

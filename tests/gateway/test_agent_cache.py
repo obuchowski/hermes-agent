@@ -126,6 +126,23 @@ class TestAgentConfigSignature:
         )
         assert sig1 != sig2
 
+    def test_session_cwd_is_stable_per_workspace_and_busts_on_change(self):
+        """Workspace is frozen per conversation, not injected per turn."""
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        sig_a1 = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys={"session_cwd": "/workspace/a"}
+        )
+        sig_a2 = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys={"session_cwd": "/workspace/a"}
+        )
+        sig_b = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys={"session_cwd": "/workspace/b"}
+        )
+        assert sig_a1 == sig_a2
+        assert sig_a1 != sig_b
+
     def test_max_tokens_change_busts_cache(self):
         """Editing model.max_tokens in config must produce a new signature."""
         from gateway.run import GatewayRunner
