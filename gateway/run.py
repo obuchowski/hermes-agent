@@ -4227,10 +4227,28 @@ class GatewayRunner(
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             parent_chat_id=str(getattr(context.source, "parent_chat_id", "") or ""),
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=getattr(context, "cwd", "") or "",
             async_delivery=_async_delivery,
             cron_session="")
+
+    async def _restore_session_workspace(self, context: SessionContext) -> str:
+        """Hydrate the exact durable session cwd before prompts or agents are built."""
+        session_id = str(context.session_id or "").strip()
+        session_row = None
+        session_db = getattr(self, "_session_db", None)
+        get_session = getattr(session_db, "get_session", None)
+        if session_id and callable(get_session):
+            # Lookup errors propagate before known-good task state is touched.
+            session_row = await get_session(session_id)
+        from gateway.session_context import restore_session_workspace, session_workspace_candidate
+        candidate = session_workspace_candidate(session_id, session_row)
+        valid = bool(candidate is not None and await asyncio.to_thread(candidate.is_dir))
+        return restore_session_workspace(
+            context, session_row, validated_cwd=str(candidate) if valid else "",
+        )
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""

@@ -3328,14 +3328,17 @@ def _publish_rotated_compaction(
         _foreign_tail_ceiling = agent._session_db.get_active_message_watermark(agent.session_id)
     with contextlib.suppress(Exception):  # best-effort — don't block compression on a flush error
         agent._flush_messages_to_session_db(messages, conversation_history=persisted_history)
-    # Publish closure + child + handoff in one transaction so no reader sees an empty child. Child stays on the
-    # parent's profile ("default" persists as NULL) and keeps a live /yolo; publish COALESCEs from the parent row.
-    _profile_for_child = None
-    with contextlib.suppress(Exception):
-        from hermes_cli.profiles import get_active_profile_name
-        _profile_for_child = get_active_profile_name()
-    _profile_for_child = None if _profile_for_child == "default" else _profile_for_child
-    old_title = agent._session_db.get_session_title(agent.session_id)
+
+    # Publish closure + child + handoff in one transaction so no reader sees an
+    # empty child. Snapshot the exact parent identity before publishing.
+    # Snapshot identity from the exact durable parent. A failed/missing read is
+    # not permission to rotate into a different workspace/profile.
+    old_session_row = agent._session_db.get_session(agent.session_id)
+    if not isinstance(old_session_row, dict):
+        raise RuntimeError(f"Cannot rotate missing parent session {agent.session_id}")
+    old_title = old_session_row.get("title")
+    old_cwd = old_session_row.get("cwd")
+    old_profile_name = old_session_row.get("profile_name")
     new_session_id = mint_session_id()
     from agent.context_compressor import _DB_PERSISTED_MARKER
     from tools.approval_yolo import with_session_yolo
@@ -3344,7 +3347,7 @@ def _publish_rotated_compaction(
         source=_compression_child_source(agent, old_session_id), model=agent.model,
         model_config=with_session_yolo(agent._session_init_model_config, old_session_id),
         system_prompt=new_system_prompt, messages=compressed,
-        cwd=getattr(agent, "working_directory", None), profile_name=_profile_for_child,
+        cwd=old_cwd, profile_name=old_profile_name,
         compression_lock_holder=lease.holder, require_compression_lease=lease.holder is not None,
         require_lease_refresh=lease.holder is not None, lease_ttl_seconds=lease.ttl,
         watermark=(lease.watermark if _foreign_tail_ceiling is not None else None),

@@ -46,8 +46,8 @@ def _make_agent(session_db, session_id, *, in_place):
     return agent
 
 
-def _seed(db, sid, title, n=8):
-    db.create_session(sid, "cli", model="test/model")
+def _seed(db, sid, title, n=8, *, profile_name=None):
+    db.create_session(sid, "cli", model="test/model", profile_name=profile_name)
     db.set_session_title(sid, title)
     for i in range(n):
         db.append_message(
@@ -140,6 +140,32 @@ class TestInPlaceCompaction:
             roles = [m["role"] for m in compressed if m.get("role") != "system"]
             assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1))
 
+    def test_in_place_prompt_rebuild_keeps_workspace_agents_md(self, tmp_path):
+        from agent.conversation_compression import compress_context
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from hermes_state import SessionDB
+        from tools.terminal_tool import clear_task_env_overrides
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "AGENTS.md").write_text("KEEP THIS WORKSPACE RULE")
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "in-place-workspace"
+        db.create_session(sid, "discord", cwd=str(workspace))
+        agent = _make_agent(db, sid, in_place=True)
+        agent.skip_context_files = False
+        tokens = set_session_vars(session_id=sid, cwd=str(workspace))
+        try:
+            _, rebuilt_prompt = compress_context(
+                agent, [{"role": "user", "content": f"m{i}"} for i in range(8)],
+                approx_tokens=100_000, system_message="sys",
+            )
+        finally:
+            clear_session_vars(tokens)
+            clear_task_env_overrides(sid)
+            db.close()
+        assert "KEEP THIS WORKSPACE RULE" in rebuilt_prompt
+
 
     def test_rotation_still_preflushes(self):
         """Rotation MUST pre-flush so current-turn messages survive in the
@@ -173,7 +199,10 @@ class TestRotationFallbackWhenFlagOff:
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
             sid = "20260619_130000_bbbbbb"
-            _seed(db, sid, "my-research")
+            _seed(db, sid, "my-research", profile_name="programmer")
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            db.update_session_cwd(sid, str(workspace))
             agent = _make_agent(db, sid, in_place=False)
             agent._last_flushed_db_idx = 5
 
@@ -202,8 +231,31 @@ class TestRotationFallbackWhenFlagOff:
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
             ]
+            child_row = db.get_session(agent.session_id)
+            assert child_row["cwd"] == str(workspace)
+            assert child_row["profile_name"] == "programmer"
             # Rotation mode does NOT set the in-place signal.
             assert getattr(agent, "_last_compaction_in_place", False) is False
+
+    def test_rotation_parent_lookup_error_does_not_end_or_fork(self):
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "rotation-read-error"
+            _seed(db, sid, "keep-parent", profile_name="programmer")
+            agent = _make_agent(db, sid, in_place=False)
+            with patch.object(db, "get_session", side_effect=RuntimeError("sqlite unavailable")):
+                compress_context(
+                    agent, [{"role": "user", "content": "x"}] * 8,
+                    approx_tokens=100_000, system_message="sys",
+                )
+            assert agent.session_id == sid
+            assert db.get_session(sid)["end_reason"] is None
+            assert db._conn.execute(
+                "SELECT 1 FROM sessions WHERE parent_session_id = ?", (sid,)
+            ).fetchall() == []
 
 
 class TestInPlaceAntiGrowthGuard:

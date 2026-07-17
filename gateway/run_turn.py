@@ -2053,6 +2053,9 @@ class GatewayTurnMixin:
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         restore_session_yolo(session_key, session_entry.yolo is True)  # a restarted gateway's set starts empty
         context = build_session_context(source, self.config, session_entry)
+        # Handoffs retain the durable raw id. Restore its workspace before task
+        # context, prompt rendering, hygiene, or cached-agent selection.
+        await self._restore_session_workspace(context)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.

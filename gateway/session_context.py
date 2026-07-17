@@ -8,6 +8,7 @@ other's routing ids.  ``get_session_env`` is a drop-in for ``os.getenv``.
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any, Iterator
 
 # "Never set here" (falls back to os.environ for CLI/cron) vs "" = explicitly cleared (no fallback).
@@ -141,7 +142,59 @@ def set_session_vars(
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
     _runtime_cwd("set_session_cwd", cwd)
+    # Terminal/file tools keep a durable-session cwd registry in addition to
+    # the task-local ContextVar. Seed both at the same binding boundary.
+    if session_id and cwd:
+        try:
+            from tools.terminal_tool import register_task_env_overrides
+            register_task_env_overrides(session_id, {"cwd": cwd})
+        except Exception:
+            pass
     return tokens
+
+
+_UNVALIDATED_WORKSPACE: Any = object()
+
+
+def session_workspace_candidate(session_id: str, session_row: Any) -> Path | None:
+    """Resolve exact-row workspace metadata without filesystem I/O."""
+    session_id = str(session_id or "").strip()
+    row = session_row if isinstance(session_row, dict) else None
+    row_id = str((row or {}).get("id") or "").strip()
+    raw_cwd = str((row or {}).get("cwd") or "").strip()
+    if not session_id or row_id != session_id or not raw_cwd:
+        return None
+    candidate = Path(raw_cwd)
+    return candidate if candidate.is_absolute() else None
+
+
+def validate_session_workspace(session_id: str, session_row: Any) -> str:
+    """Return an existing absolute durable cwd without mutating task state."""
+    candidate = session_workspace_candidate(session_id, session_row)
+    return str(candidate) if candidate is not None and candidate.is_dir() else ""
+
+
+def restore_session_workspace(
+    context: Any, session_row: Any, *, validated_cwd: Any = _UNVALIDATED_WORKSPACE,
+) -> str:
+    """Restore the exact durable session cwd, clearing stale tool state on failure."""
+    session_id = str(getattr(context, "session_id", "") or "").strip()
+    restored = (
+        validate_session_workspace(session_id, session_row)
+        if validated_cwd is _UNVALIDATED_WORKSPACE
+        else str(validated_cwd or "")
+    )
+    context.cwd = ""
+    if not restored:
+        if session_id:
+            try:
+                from tools.terminal_tool import clear_task_env_overrides
+                clear_task_env_overrides(session_id)
+            except Exception:
+                pass
+        return ""
+    context.cwd = restored
+    return restored
 
 
 def clear_session_vars(tokens: list) -> None:

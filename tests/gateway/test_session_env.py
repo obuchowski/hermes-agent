@@ -1,5 +1,8 @@
 import asyncio
 import os
+import threading
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -11,6 +14,7 @@ from gateway.session_context import (
     set_session_vars,
     clear_session_vars,
     reset_session_vars,
+    restore_session_workspace,
     _VAR_MAP,
     _UNSET,
 )
@@ -153,6 +157,118 @@ def test_session_key_falls_back_to_os_environ(monkeypatch):
     # After clear — should return "" (explicitly cleared), not os.environ (#10304)
     clear_session_vars(tokens)
     assert get_session_env("HERMES_SESSION_KEY") == ""
+
+
+def test_handed_off_session_row_restores_cwd_and_raw_session_id(tmp_path, monkeypatch):
+    from agent.runtime_cwd import resolve_context_cwd
+    from tools.terminal_tool import clear_task_env_overrides, get_session_cwd
+
+    process_cwd, workspace = tmp_path / "gateway-default", tmp_path / "workspace"
+    process_cwd.mkdir()
+    workspace.mkdir()
+    monkeypatch.chdir(process_cwd)
+    context = SessionContext(
+        source=SessionSource(platform=Platform.DISCORD, chat_id="chan", chat_type="channel"),
+        connected_platforms=[], home_channels={}, session_key="route", session_id="handoff-session",
+    )
+    assert restore_session_workspace(
+        context, {"id": "handoff-session", "cwd": str(workspace)}
+    ) == str(workspace)
+    runner = object.__new__(GatewayRunner)
+    tokens = runner._set_session_env(context)
+    try:
+        assert get_session_env("HERMES_SESSION_ID") == "handoff-session"
+        assert resolve_context_cwd() == workspace
+        assert get_session_cwd("handoff-session") == str(workspace)
+    finally:
+        runner._clear_session_env(tokens)
+        clear_task_env_overrides("handoff-session")
+
+
+@pytest.mark.asyncio
+async def test_gateway_queries_raw_durable_session_id_before_binding(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    context = SessionContext(
+        source=SessionSource(platform=Platform.DISCORD, chat_id="chan"),
+        connected_platforms=[], home_channels={}, session_id="raw-handoff-id",
+    )
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = type("AsyncDB", (), {})()
+    runner._session_db.get_session = AsyncMock(
+        return_value={"id": "raw-handoff-id", "cwd": str(workspace)}
+    )
+    assert await runner._restore_session_workspace(context) == str(workspace)
+    runner._session_db.get_session.assert_awaited_once_with("raw-handoff-id")
+    assert context.cwd == str(workspace)
+
+
+@pytest.mark.asyncio
+async def test_gateway_workspace_validation_runs_off_event_loop(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    context = SessionContext(
+        source=SessionSource(platform=Platform.DISCORD, chat_id="chan"),
+        connected_platforms=[], home_channels={}, session_id="off-loop-session",
+    )
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = type("AsyncDB", (), {})()
+    runner._session_db.get_session = AsyncMock(
+        return_value={"id": "off-loop-session", "cwd": str(workspace)}
+    )
+    loop_thread, validation_threads = threading.get_ident(), []
+    real_is_dir = Path.is_dir
+
+    def recording_is_dir(path):
+        validation_threads.append(threading.get_ident())
+        return real_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", recording_is_dir)
+    assert await runner._restore_session_workspace(context) == str(workspace)
+    assert validation_threads and validation_threads[0] != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_gateway_workspace_lookup_error_preserves_known_good_state(tmp_path):
+    from tools.terminal_tool import clear_task_env_overrides, get_session_cwd, register_task_env_overrides
+
+    session_id = "lookup-error-session"
+    known_good = tmp_path / "known-good"
+    known_good.mkdir()
+    context = SessionContext(
+        source=SessionSource(platform=Platform.DISCORD, chat_id="chan"),
+        connected_platforms=[], home_channels={}, session_id=session_id,
+    )
+    context.cwd = str(known_good)
+    register_task_env_overrides(session_id, {"cwd": str(known_good)})
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = type("AsyncDB", (), {})()
+    runner._session_db.get_session = AsyncMock(side_effect=RuntimeError("sqlite unavailable"))
+    try:
+        with pytest.raises(RuntimeError, match="sqlite unavailable"):
+            await runner._restore_session_workspace(context)
+        assert context.cwd == str(known_good)
+        assert get_session_cwd(session_id) == str(known_good)
+    finally:
+        clear_task_env_overrides(session_id)
+
+
+def test_invalid_handed_off_cwd_clears_stale_task_state(tmp_path):
+    from tools.terminal_tool import get_session_cwd, register_task_env_overrides
+
+    session_id = "invalid-cwd-session"
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    register_task_env_overrides(session_id, {"cwd": str(stale)})
+    context = SessionContext(
+        source=SessionSource(platform=Platform.DISCORD, chat_id="chan"),
+        connected_platforms=[], home_channels={}, session_id=session_id,
+    )
+    assert restore_session_workspace(
+        context, {"id": session_id, "cwd": str(tmp_path / "missing")}
+    ) == ""
+    assert context.cwd == ""
+    assert get_session_cwd(session_id) is None
 
 
 def test_session_key_no_race_condition_with_contextvars(monkeypatch):
