@@ -460,7 +460,7 @@ def _requires_argument(args_hint: str) -> bool:
 
 
 def gateway_help_lines() -> list[str]:
-    """Generate gateway help text lines from the registry."""
+    """Generate gateway help text lines from built-in and plugin registries."""
     overrides = _resolve_config_gates()
     lines: list[str] = []
     for cmd in COMMAND_REGISTRY:
@@ -475,6 +475,9 @@ def gateway_help_lines() -> list[str]:
             alias_parts.append(f"`/{a}`")
         alias_note = f" (alias: {', '.join(alias_parts)})" if alias_parts else ""
         lines.append(f"`/{cmd.name}{args}` -- {cmd.description}{alias_note}")
+    for name, description, args_hint in _iter_plugin_command_entries():
+        args = f" {args_hint}" if args_hint else ""
+        lines.append(f"`/{name}{args}` -- {description}")
     return lines
 
 

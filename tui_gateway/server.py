@@ -14216,10 +14216,17 @@ def _(rid, params: dict) -> dict:
     if _cmd_base:
         try:
             from hermes_cli.plugins import (
+                get_plugin_command,
                 get_plugin_command_handler,
                 resolve_plugin_command_result,
             )
 
+            plugin_command = get_plugin_command(_cmd_base)
+            if plugin_command and plugin_command.get("gateway_context"):
+                return _err(
+                    rid, 4019,
+                    f"gateway-context plugin command: use a messaging gateway for /{_cmd_base}",
+                )
             plugin_handler = get_plugin_command_handler(_cmd_base)
         except Exception:
             plugin_handler = None

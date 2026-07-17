@@ -376,6 +376,124 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    async def _plugin_gateway_command_context(self, source: SessionSource):
+        """Build the typed, same-route capability context for a plugin command."""
+        from hermes_cli.plugins import PluginCommandContext
+        from hermes_cli.profiles import get_active_profile_name
+
+        # Inbound routing stamps ``source.profile`` through the same canonical
+        # build_source/authentication path used by the gateway.  Sources which
+        # bypass that path are resolved defensively through the route matcher.
+        # Do not independently reinterpret the multiplex config here: it may
+        # differ from the effective runtime override that produced ``source``.
+        profile_name = (getattr(source, "profile", "") or "").strip()
+        if not profile_name:
+            profile_name = self._profile_name_for_source(source) or ""
+        profile_name = profile_name or get_active_profile_name() or "default"
+
+        session_key = self._session_key_for_source(source)
+        session_id = await self.async_session_store.peek_session_id(session_key) or ""
+        current_cwd = ""
+        if session_id:
+            db = getattr(self.session_store, "_db", None)
+            if db is not None:
+                row = await asyncio.to_thread(db.get_session, session_id)
+                current_cwd = str((row or {}).get("cwd") or "").strip()
+
+        async def _create(request):
+            from gateway.session import canonicalize_session_cwd
+            from hermes_cli.plugins import FreshSessionResult
+
+            # Validation is intentionally complete before the lifecycle seam
+            # performs its single durable transaction.
+            canonical_cwd = canonicalize_session_cwd(
+                request.cwd, current_cwd=current_cwd
+            )
+            new_entry = await self.async_session_store.create_and_activate_fresh_session(
+                source,
+                cwd=canonical_cwd,
+                profile_name=profile_name,
+            )
+
+            result = FreshSessionResult(
+                session_id=new_entry.session_id,
+                cwd=canonical_cwd,
+                profile_name=profile_name,
+            )
+
+            # The DB transaction above is the commit boundary.  Everything
+            # below is in-memory/cache bookkeeping and must not turn an
+            # already-active durable route into a false command failure.  Run
+            # every cleanup independently so one stale cache cannot prevent
+            # the remaining boundary state from being cleared.
+            cleanup_steps = (
+                (
+                    "run generation",
+                    lambda: self._invalidate_session_run_generation(
+                        session_key, reason="fresh_session_activation"
+                    ),
+                ),
+                ("running agent", lambda: self._release_running_agent_state(session_key)),
+                ("agent cache", lambda: self._evict_cached_agent(session_key)),
+                (
+                    "model override",
+                    lambda: getattr(self, "_session_model_overrides", {}).pop(
+                        session_key, None
+                    ),
+                ),
+                (
+                    "reasoning override",
+                    lambda: self._set_session_reasoning_override(session_key, None),
+                ),
+                (
+                    "pending model note",
+                    lambda: getattr(self, "_pending_model_notes", {}).pop(
+                        session_key, None
+                    ),
+                ),
+                (
+                    "resolved model cache",
+                    lambda: getattr(self, "_last_resolved_model", {}).pop(
+                        session_key, None
+                    ),
+                ),
+                (
+                    "security boundary state",
+                    lambda: self._clear_session_boundary_security_state(session_key),
+                ),
+            )
+            for label, cleanup in cleanup_steps:
+                try:
+                    cleanup()
+                except Exception:
+                    logger.warning(
+                        "Fresh session %s committed but %s cleanup failed",
+                        new_entry.session_id,
+                        label,
+                        exc_info=True,
+                    )
+
+            try:
+                if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+                    await asyncio.to_thread(
+                        self._record_telegram_topic_binding, source, new_entry
+                    )
+            except Exception:
+                logger.warning(
+                    "Fresh session %s committed but Telegram topic binding failed",
+                    new_entry.session_id,
+                    exc_info=True,
+                )
+
+            return result
+
+        return PluginCommandContext(
+            effective_profile_name=profile_name,
+            session_id=session_id,
+            cwd=current_cwd,
+            _fresh_session_factory=_create,
+        )
+
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.
 

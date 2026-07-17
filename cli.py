@@ -8992,6 +8992,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 )
                 plugin_handler = get_plugin_command_handler(base_cmd.lstrip("/"))
                 if plugin_handler:
+                    from hermes_cli.plugins import get_plugin_command
+                    plugin_command = get_plugin_command(base_cmd.lstrip("/")) or {}
+                    if plugin_command.get("gateway_context"):
+                        _cprint("This plugin command is available only in an authenticated gateway session.")
+                        return
                     user_args = cmd_original[len(base_cmd):].strip()
                     try:
                         result = resolve_plugin_command_result(

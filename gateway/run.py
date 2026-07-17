@@ -9732,6 +9732,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+            _plugin_cmd_inner = None
+            _guarded_cmd_name = _cmd_def_inner.name if _cmd_def_inner else None
+            if _evt_cmd and _cmd_def_inner is None:
+                try:
+                    from hermes_cli.plugins import (
+                        get_plugin_command as _get_plugin_command_inner,
+                    )
+
+                    _plugin_cmd_inner = _get_plugin_command_inner(
+                        _evt_cmd.replace("_", "-")
+                    )
+                    if _plugin_cmd_inner is not None:
+                        _guarded_cmd_name = _evt_cmd.replace("_", "-")
+                except Exception:
+                    _plugin_cmd_inner = None
 
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
@@ -9739,8 +9754,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # /status above is intentionally pre-gate so users always see
             # session state. /help and /whoami fall under the always-allowed
             # floor inside _check_slash_access.
-            if _evt_cmd and _cmd_def_inner is not None:
-                _denied = self._check_slash_access(source, _cmd_def_inner.name)
+            if _guarded_cmd_name is not None:
+                _denied = self._check_slash_access(source, _guarded_cmd_name)
                 if _denied is not None:
                     return _denied
 
@@ -9978,9 +9993,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # slash commands) would interrupt the agent AND get
             # silently discarded by the slash-command safety net,
             # producing a zero-char response. See #5057, #6252, #10370.
-            if _cmd_def_inner:
+            if _guarded_cmd_name is not None:
                 return (
-                    f"⏳ Agent is running — `/{_cmd_def_inner.name}` can't run "
+                    f"⏳ Agent is running — `/{_guarded_cmd_name}` can't run "
                     f"mid-turn. Wait for the current response or `/stop` first."
                 )
 
@@ -10571,19 +10586,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugin-registered slash commands
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import (
+                    get_plugin_command,
+                    get_plugin_command_handler,
+                )
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
+                normalized_command = command.replace("_", "-")
+                plugin_command = get_plugin_command(normalized_command)
+                plugin_handler = (
+                    plugin_command["handler"]
+                    if plugin_command
+                    else get_plugin_command_handler(normalized_command)
+                )
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
+                    if plugin_command and plugin_command.get("gateway_context"):
+                        command_context = await self._plugin_gateway_command_context(source)
+                        result = plugin_handler(user_args, command_context)
+                    else:
+                        result = plugin_handler(user_args)
                     if asyncio.iscoroutine(result):
                         result = await result
-                    return str(result) if result else None
+                    return result if isinstance(result, str) else (str(result) if result else None)
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
+                return f"Plugin command failed: {e}"
 
         # Skill slash commands: /skill-name loads the skill and sends to agent.
         # resolve_skill_command_key() handles the Telegram underscore/hyphen
