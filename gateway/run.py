@@ -19859,20 +19859,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if message:
                     _resume_guidance = (
                         "Address the user's NEW message below FIRST and focus "
-                        "on what the user is asking now."
+                        "on what the user is asking now. Use the conversation "
+                        "history as context and continue any still-authorized "
+                        "work the new message implies."
                     )
                 else:
                     _resume_guidance = (
-                        "Report to the user that the session was restored "
-                        "successfully and ask what they would like to do next."
+                        "Inspect the conversation history and continue the latest "
+                        "unfinished user-authorized task from the next safe step. "
+                        "If no unfinished task is clear, briefly report recovery "
+                        "and ask what the user would like to do next."
                     )
                 message = (
                     f"[System note: The previous turn was interrupted by "
                     f"{_reason_phrase}; the gateway is now back online. "
                     f"Any restart/shutdown command in the history has already "
                     f"run — do NOT re-execute or verify it. {_resume_guidance} "
-                    f"Do NOT re-execute old tool calls — skip any unfinished "
-                    f"work from the conversation history.]"
+                    f"Do NOT re-execute old tool calls blindly; reuse persisted "
+                    f"results and revalidate only when needed.]"
                     + (f"\n\n{message}" if message else "")
                 )
             elif _has_fresh_tool_tail:
@@ -19925,11 +19929,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"[System note: The previous turn was interrupted by "
                     f"{_sn_reason_phrase}; the gateway is now back online. "
                     f"Any restart/shutdown command in the history has already "
-                    f"run — do NOT re-execute or verify it. Report to the user "
-                    f"that the session was restored successfully and ask what "
-                    f"they would like to do next. Do NOT re-execute old tool "
-                    f"calls — skip any unfinished work from the conversation "
-                    f"history.]"
+                    f"run — do NOT re-execute or verify it. Inspect the conversation "
+                    f"history and continue the latest unfinished user-authorized "
+                    f"task from the next safe step. If no unfinished task is clear, "
+                    f"briefly report recovery and ask what the user would like to do "
+                    f"next. Do NOT re-execute old tool calls blindly; reuse persisted "
+                    f"results and revalidate only when needed.]"
                 )
 
             _approval_session_key = session_key or ""
