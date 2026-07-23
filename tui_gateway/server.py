@@ -5293,6 +5293,7 @@ def _init_session(
             "created_at": now,
             "last_active": now,
             "running": False,
+            "_steer_open": False,
             "attached_images": [],
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
@@ -5787,7 +5788,7 @@ def _handle_busy_submit(
         # though no injection boundary remains.
         if (
             mode == "steer"
-            and session.get("_steer_open") is True
+            and session.get("_steer_open") is not False
             and agent is not None
             and hasattr(agent, "steer")
         ):
@@ -5975,6 +5976,7 @@ def _(rid, params: dict) -> dict:
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False,
+            "_steer_open": False,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
             "source": source,
@@ -6348,6 +6350,7 @@ def _deferred_session_record(
         "resume_runtime_overrides": resume_runtime_overrides,
         "resume_session_id": session_key,
         "running": False,
+        "_steer_open": False,
         "session_key": session_key,
         "session_db": session_db,
         "session_db_owned": session_db_owned,
@@ -9778,7 +9781,7 @@ def _(rid, params: dict) -> dict:
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")
     with session["history_lock"]:
-        if not session.get("running") or session.get("_steer_open") is not True:
+        if session.get("_steer_open") is False:
             accepted = False
         else:
             try:
