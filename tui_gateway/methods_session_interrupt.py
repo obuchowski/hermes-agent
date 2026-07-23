@@ -114,12 +114,17 @@ def _(rid, params: dict) -> dict:
 def _apply_correction(rid, session: dict, verb: str, text: str, accepted_status: str) -> dict:
     """``agent.<verb>(text)``; on acceptance record it on the live turn (mid-turn resume rebuilds the bubble)
     and purge queued self-copies so post-turn drain cannot re-fire the old prompt."""
-    try:
-        accepted = getattr(session["agent"], verb)(text)
-    except Exception as exc:
-        return _err(rid, 5000, f"{verb} failed: {exc}")
-    if accepted:
-        with session["history_lock"]:
+    with session["history_lock"]:
+        if verb == "steer" and (
+            not session.get("running") or session.get("_steer_open") is not True
+        ):
+            accepted = False
+        else:
+            try:
+                accepted = getattr(session["agent"], verb)(text)
+            except Exception as exc:
+                return _err(rid, 5000, f"{verb} failed: {exc}")
+        if accepted:
             _record_inflight_correction(session, text)
             # #84417: steer does not cancel the live original, but a server queue self-copy of that original
             # must still not re-fire after settle (same class as redirect).
