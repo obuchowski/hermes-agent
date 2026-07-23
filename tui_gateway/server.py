@@ -5781,14 +5781,22 @@ def _handle_busy_submit(
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
-    if mode == "steer" and agent is not None and hasattr(agent, "steer"):
-        try:
-            if agent.steer(text):
-                with session["history_lock"]:
+        # Keep the live-window check and steer() call under the same lock as
+        # turn teardown. Otherwise a prompt can pass the check, the agent can
+        # finish, and the now-late steer can still report acceptance even
+        # though no injection boundary remains.
+        if (
+            mode == "steer"
+            and session.get("_steer_open") is True
+            and agent is not None
+            and hasattr(agent, "steer")
+        ):
+            try:
+                if agent.steer(text):
                     session["last_active"] = time.time()
-                return _ok(rid, {"status": "steered"})
-        except Exception:
-            pass  # fall through to queue
+                    return _ok(rid, {"status": "steered"})
+            except Exception:
+                pass  # fall through to queue
     # Queue before asking the live turn to stop. In particular, never call a
     # provider or compute-host method while holding history_lock: an interrupt
     # can wait behind the very operation it is trying to cancel.
@@ -9769,10 +9777,14 @@ def _(rid, params: dict) -> dict:
     agent = session.get("agent")
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")
-    try:
-        accepted = agent.steer(text)
-    except Exception as exc:
-        return _err(rid, 5000, f"steer failed: {exc}")
+    with session["history_lock"]:
+        if not session.get("running") or session.get("_steer_open") is not True:
+            accepted = False
+        else:
+            try:
+                accepted = agent.steer(text)
+            except Exception as exc:
+                return _err(rid, 5000, f"steer failed: {exc}")
     return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
 
 
@@ -10326,6 +10338,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             agent.clear_interrupt()
         except Exception:
             pass
+    with session["history_lock"]:
+        session["_steer_open"] = True
     _emit("message.start", sid)
 
     def run():
@@ -10489,6 +10503,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             except (TypeError, ValueError):
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
+            with session["history_lock"]:
+                session["_steer_open"] = False
             if "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 # Restore the model the user was on before the /moa one-shot.
@@ -10534,6 +10550,20 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             last_reasoning = None
             status_note = None
             if isinstance(result, dict):
+                # A steer can be accepted while the model is producing its
+                # final response, after the last tool-result boundary where it
+                # could be injected. The agent finalizer hands that text back
+                # as pending_steer; queue it as the next real user turn so an
+                # accepted Desktop message is delivered exactly once instead
+                # of disappearing at turn teardown.
+                leftover_steer = result.get("pending_steer")
+                if leftover_steer:
+                    with session["history_lock"]:
+                        _enqueue_prompt(
+                            session,
+                            str(leftover_steer),
+                            session.get("transport"),
+                        )
                 if isinstance(result.get("messages"), list):
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
@@ -10789,6 +10819,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # this turn can't fire during a later turn on the same agent.
             agent.interim_assistant_callback = None
             with session["history_lock"]:
+                session["_steer_open"] = False
                 session["running"] = False
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
