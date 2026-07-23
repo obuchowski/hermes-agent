@@ -2213,9 +2213,15 @@ def get_plugin_context_engine():
     return _ensure_plugins_discovered()._context_engine
 
 
+def get_plugin_command(name: str) -> Optional[Dict[str, Any]]:
+    """Return metadata for a plugin-registered slash command, or ``None``."""
+    normalized = str(name or "").strip().lstrip("/").replace("_", "-")
+    return _ensure_plugins_discovered()._plugin_commands.get(normalized)
+
+
 def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
-    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    entry = get_plugin_command(name)
     return entry["handler"] if entry else None
 
 

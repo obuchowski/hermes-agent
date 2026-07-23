@@ -255,7 +255,7 @@ def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: 
         # Serialize the last live-injection boundary with turn teardown. A late
         # steer must fall through to the durable next-turn queue, not report a
         # false acceptance after the agent has already returned.
-        if not session.get("running") or session.get("_steer_open") is not True:
+        if not session.get("running") or session.get("_steer_open") is False:
             return None
         try:
             if not getattr(agent, method)(plain_text):

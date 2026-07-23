@@ -84,7 +84,7 @@ def _apply_correction(rid, session: dict, verb: str, text: str, accepted_status:
     and purge queued self-copies so post-turn drain cannot re-fire the old prompt."""
     with session["history_lock"]:
         if verb == "steer" and (
-            not session.get("running") or session.get("_steer_open") is not True
+            not session.get("running") or session.get("_steer_open") is False
         ):
             accepted = False
         else:
