@@ -444,7 +444,22 @@ def _run_post_turn_followups(
     steer = result.get("pending_steer") if isinstance(result, dict) else None
     if isinstance(steer, str) and steer.strip():
         with session["history_lock"]:
-            _enqueue_prompt(session, steer, session.get("transport"))
+            pending = steer.strip()
+            head = session.get("queued_prompt")
+            if isinstance(head, dict) and isinstance(head.get("text"), str) and not head.get("image_paths"):
+                updated = dict(head)
+                later = head["text"]
+                updated["text"] = f"{pending}\n\n{later}" if later else pending
+                session["queued_prompt"] = updated
+            else:
+                queued = {
+                    "text": pending,
+                    "transport": session.get("transport"),
+                }
+                _ac_set_queue(
+                    session,
+                    [queued, *([head] if head else []), *(session.get("queued_prompts") or [])],
+                )
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:
@@ -810,6 +825,8 @@ def _invoke_agent(
         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
             st.result = agent.run_conversation(run_message, **st.run_kwargs)
     finally:
+        with session["history_lock"]:
+            session["_steer_open"] = False
         # Stop AND join before anything emits: a tick surviving past message.complete would
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
         _usage_stop.set()
@@ -1158,6 +1175,8 @@ def _run_prompt_submit(
         "kind=%s chars=%s images=%d",
         sid, session.get("session_key") or "", getattr(agent, "session_id", "") or "",
         display_kind or "user", len(text) if isinstance(text, str) else "-", len(images))
+    with session["history_lock"]:
+        session["_steer_open"] = True
     if not muted:
         _emit("message.start", sid)
 
@@ -1209,6 +1228,7 @@ def _run_prompt_submit(
                 # A stale interim closure must not fire during a later turn.
                 st.agent.interim_assistant_callback = None
                 with session["history_lock"]:
+                    session["_steer_open"] = False
                     session["running"] = False
                     session["last_active"] = time.time()
                     session.pop("_turn_user_input", None)  # per turn: never leaks into the next one
