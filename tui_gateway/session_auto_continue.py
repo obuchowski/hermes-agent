@@ -247,12 +247,17 @@ def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: 
     """Apply ``agent.<method>(plain_text)`` (steer/redirect); on acceptance record the correction, scrub stale
     self-duplicates so the live turn's original text is not re-fired after settle, and return the ``status`` reply.
     None → caller falls through to the queue path."""
-    try:
-        if not getattr(agent, method)(plain_text):
-            return None
-    except Exception:
-        return None
     with session["history_lock"]:
+        # Serialize the last live-injection boundary with turn teardown. A late
+        # steer must fall through to the durable next-turn queue, not report a
+        # false acceptance after the agent has already returned.
+        if not session.get("running") or session.get("_steer_open") is not True:
+            return None
+        try:
+            if not getattr(agent, method)(plain_text):
+                return None
+        except Exception:
+            return None
         _record_inflight_correction(session, plain_text)
         _drop_queued_duplicates_of_inflight_user(session)
         session["last_active"] = time.time()
