@@ -1366,7 +1366,7 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
             # Project forward through compression chain so resumes land on
             # the live tip instead of a dead compressed parent.
             try:
-                resolved.db.close()
+                resolved_id = db.get_compression_tip(resolved_id) or resolved_id
             except Exception:
                 pass
         return resolved_id
@@ -1780,11 +1780,6 @@ def cmd_chat(args):
 
     passthrough = {k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH}
     if use_tui:
-        if resolved_session_ref is not None:
-            try:
-                resolved_session_ref.db.close()
-            except Exception:
-                pass
         _launch_tui(
             passthrough.pop("resume"),
             tui_dev=getattr(args, "tui_dev", False),
