@@ -1128,6 +1128,9 @@ def _run_approval_guards(command: str, env_type: str, config: dict[str, Any], *,
                 pattern_key=approval.get("pattern_key", ""),
                 smart_denied=approval.get("smart_denied", False),
                 allow_permanent=approval.get("allow_permanent", True),
+                allow_session=approval.get("allow_session", True),
+                one_shot_only=approval.get("one_shot_only", False),
+                choices=approval.get("choices"),
             ))
         desc = approval.get("description", "command flagged")
         fallback_msg = (

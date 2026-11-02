@@ -627,6 +627,14 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
         from tools.terminal_tool import _get_approval_callback
         if not _no_user_can_answer():
             approval_callback = _get_approval_callback()
+
+    def _check_executable_confirm(command: str):
+        from tools.approval import check_executable_confirm_guard
+
+        return check_executable_confirm_guard(
+            command,
+            approval_callback=approval_callback,
+        )
     # Gateway/cron have no UI for codex approval requests, so exec/apply_patch fail closed by default. Only an
     # explicit approval bypass (approvals.mode: off, /yolo, --yolo, HERMES_YOLO_MODE) hands policy to codex's sandbox.
     auto_approve_requests = False
@@ -655,6 +663,7 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
     agent._codex_session = CodexAppServerSession(
         cwd=getattr(agent, "session_cwd", None) or str(resolve_agent_cwd()), approval_callback=approval_callback,
         codex_bin=get_configured_codex_binary(load_config()),
+        executable_confirm_callback=_check_executable_confirm,
         request_routing=_ServerRequestRouting(auto_approve_exec=auto_approve_requests, auto_approve_apply_patch=auto_approve_requests),
         on_event=make_codex_app_server_event_bridge(agent),
         developer_instructions=developer_instructions or None,
