@@ -3107,12 +3107,12 @@ approvals:
 |------|----------|
 | `smart` (default) | Use an auxiliary LLM to assess whether a flagged command is actually dangerous. Low-risk commands are auto-approved for that command only. Genuinely risky commands are denied; uncertain decisions escalate to the user. |
 | `manual` | Prompt the user before executing any flagged command. In the CLI, shows an interactive approval dialog. In messaging, queues a pending approval request. |
-| `off` | Skip all approval checks. Equivalent to `HERMES_YOLO_MODE=true`. **Use with caution.** |
+| `off` | Skip ordinary approval checks. Hardline blocks, `approvals.deny`, and `approvals.confirm` still apply. **Use with caution.** |
 
 Smart mode is particularly useful for reducing approval fatigue — it lets the agent work more autonomously on safe operations while still catching genuinely destructive commands.
 
 :::warning
-Setting `approvals.mode: off` disables all safety checks for terminal commands. Only use this in trusted, sandboxed environments.
+Setting `approvals.mode: off` disables ordinary safety prompts. Always-on hardline, deny, and executable-confirm policy remains active.
 :::
 
 ### Denial circuit breaker
@@ -3136,6 +3136,19 @@ approvals:
 ```
 
 Patterns are case-insensitive fnmatch globs and must be quoted in YAML (a bare leading `*` is a parse error). See [Security — User-Defined Deny Rules](./security.md#user-defined-deny-rules-approvalsdeny) for details.
+
+### Executable confirmation rules
+
+Use `approvals.confirm` to require a fresh human approval for selected executable basenames, even under YOLO or `mode: off`:
+
+```yaml
+approvals:
+  mode: off
+  confirm:
+    - executable: aws
+```
+
+The precedence is hardline blocklist → `approvals.deny` → `approvals.confirm` → ordinary bypass/approval policy. Matching is case-insensitive at shell command positions (including wrappers, assignments, chains, pipelines, subshells, and literal shell `-c` commands). Interactive surfaces offer only **Allow once / Deny** and never persist the choice; cron, single-query, unattended-platform, and otherwise headless runs fail closed. `execute_code` also recognizes direct literal `subprocess` and `os.system` invocations without evaluating the script. See [Security — Executable Confirmation Rules](/user-guide/security#executable-confirmation-rules-approvalsconfirm).
 
 ### Custom smart-approval policy
 

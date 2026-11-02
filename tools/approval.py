@@ -38,6 +38,11 @@ from tools.approval_floors import (
 )
 from tools.approval_gateway_wait import _await_gateway_decision
 from tools.approval_provenance import allowlisted_result, preapproved_result
+from tools.approval_confirm import (
+    _MAX_LITERAL_SHELL_RECURSION,
+    _match_execute_code_confirm_rule,
+    _match_executable_confirm_rule,
+)
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
 from tools.approval_smart import _smart_verdict
 
@@ -147,9 +152,9 @@ def resolve_gateway_approval(session_key: str, choice: str,
                              request_id: Optional[str] = None) -> int:
     """Unblock waiting agent thread(s) from the gateway's /approve or /deny handler.
 
-    *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
-    (FIFO) or the one matching *request_id*. *reason* is the ``/deny <reason>`` free text,
-    relayed to the agent in the BLOCKED message. Returns the number resolved.
+    *resolve_all* resolves every eligible pending approval (``/approve all``); one-shot
+    confirmations are excluded from bulk approval (but not bulk denial). Otherwise the oldest
+    (FIFO) or the one matching *request_id* is resolved. *reason* is relayed to the agent.
     """
     with _lock:
         queue = _gateway_queues.get(session_key)
@@ -160,6 +165,9 @@ def resolve_gateway_approval(session_key: str, choice: str,
             if not targets:
                 return 0
             queue[:] = [entry for entry in queue if entry not in targets]
+        elif resolve_all and choice != "deny":
+            targets = [entry for entry in queue if not entry.data.get("one_shot_only")]
+            queue[:] = [entry for entry in queue if entry.data.get("one_shot_only")]
         elif resolve_all:
             targets = list(queue)
             queue.clear()
@@ -639,16 +647,19 @@ def _gateway_notify_cb(session_key: str):
 
 def _pending_result(spec, session_key: str, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], body: str | None,
-                    smart_denied: bool) -> dict:
+                    smart_denied: bool, one_shot_only: bool = False) -> dict:
     """Queue an approval nobody can answer right now (no gateway notifier, no CLI panel) for
     ``/approve`` / ``/deny`` review. Command/code gates return the backward-compatible
     ``pending_approval`` shape (``pattern_keys`` + STOP text); the action gate ``approval_required``."""
-    pending = {"command": command, "pattern_key": pattern_key}
+    pending: dict = {"command": command, "pattern_key": pattern_key}
     if spec.pending_keys:
         pending["pattern_keys"] = pattern_keys
     pending["description"] = description
     if smart_denied:
         pending.update(smart_denied=True, allow_permanent=False)
+    if one_shot_only:
+        pending.update(one_shot_only=True, allow_permanent=False,
+                       allow_session=False, choices=["once", "deny"])
     submit_pending(session_key, pending)
     if not spec.pending_keys:
         return {
@@ -670,6 +681,9 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     }
     if smart_denied:
         result.update(smart_denied=True, allow_permanent=False)
+    if one_shot_only:
+        result.update(one_shot_only=True, allow_permanent=False,
+                      allow_session=False, choices=["once", "deny"])
     return result
 
 
@@ -914,7 +928,8 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
-                    is_ask: bool, smart: bool = False, pending_body=None) -> dict:
+                    is_ask: bool, smart: bool = False, pending_body=None,
+                    one_shot_only: bool = False) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``pattern_keys`` are what :func:`_persist_choice` stores on session/always; a smart-DENY
@@ -930,7 +945,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = not smart_denied
+    allow_permanent = not smart_denied and not one_shot_only
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -944,7 +959,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
 
     def grant(choice: str) -> dict:
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
-        if not smart_denied:
+        if not smart_denied and not one_shot_only:
             _persist_choice(session_key, choice, pattern_keys)
         if spec.user_approved:
             return _user_approved(session_key, description)
@@ -953,7 +968,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     if spec.transport:
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
-            session_key=session_key, allow_session=not smart_denied, allow_permanent=allow_permanent,
+            session_key=session_key, allow_session=not smart_denied and not one_shot_only, allow_permanent=allow_permanent,
             surface=approval_context.gateway_approval_surface() if (is_gateway or is_ask) else "cli",
         )
         choice, denied = _transport_choice(attempt, pattern_key=pattern_key, description=description)
@@ -979,11 +994,13 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": allow_permanent,
+                "allow_session": not smart_denied and not one_shot_only,
             }
             if smart_denied:
                 data["smart_denied"] = True
+            if one_shot_only:
+                data.update(one_shot_only=True, choices=["once", "deny"])
             decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
             if decision.get("notify_failed"):
                 return _denied(spec.notify_failed, pattern_key=pattern_key,
@@ -1019,6 +1036,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             return _pending_result(
                 spec, session_key, command=display_command, description=display_description, pattern_key=pattern_key,
                 pattern_keys=pattern_keys, body=pending_body, smart_denied=smart_denied,
+                one_shot_only=one_shot_only,
             )
 
     # CLI interactive: single combined prompt, wrapped in the pre/post plugin hooks.
@@ -1029,8 +1047,11 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     hook_kwargs = dict(command=prompt_command, description=prompt_description, pattern_key=pattern_key,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
-    choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
-                                       smart_denied=smart_denied, approval_callback=approval_callback)
+    choice = prompt_dangerous_approval(
+        prompt_command, prompt_description, allow_permanent=allow_permanent,
+        allow_session=not smart_denied and not one_shot_only,
+        smart_denied=smart_denied, approval_callback=approval_callback,
+    )
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
@@ -1186,6 +1207,55 @@ def _user_deny_block(command: str) -> dict | None:
     return _user_deny_block_result(deny_pattern)
 
 
+def _run_executable_confirm_gate(executable: str, display_target: str, *, approval_callback=None) -> dict:
+    """Require one fresh human decision for a configured executable."""
+    pattern_key = f"executable-confirm:{executable}"
+    description = (
+        f"approvals.confirm requires explicit approval for executable '{executable}' "
+        "on every invocation"
+    )
+    # Explicit unattended markers beat inherited interactive flags. In particular,
+    # cron and -q cannot accidentally grow a live approval surface.
+    contexts = _unattended_contexts()
+    if contexts:
+        context = contexts[0]
+        context_name = context.name.replace("_", "-")
+        message = (
+            f"BLOCKED: executable '{executable}' matches approvals.confirm, but "
+            f"{context_name} has no live human approval surface. This one-shot "
+            f"requirement overrides approvals.{context.cfg_key}: approve."
+        )
+        return {**_blocked(message, pattern_key=pattern_key, description=description),
+                "executable_confirm": True}
+
+    approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
+    if not is_cli and not is_gateway:
+        message = (
+            f"BLOCKED: executable '{executable}' matches approvals.confirm, but no "
+            "interactive user or gateway is present to approve this invocation."
+        )
+        return {**_blocked(message, pattern_key=pattern_key, description=description),
+                "executable_confirm": True}
+
+    result = _human_decision(
+        _COMMAND_GATE, command=display_target, description=description,
+        pattern_key=pattern_key, pattern_keys=[pattern_key],
+        warnings=[(pattern_key, None, False)], session_key=get_current_session_key(),
+        approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway,
+        is_ask=is_ask, one_shot_only=True,
+    )
+    result["executable_confirm"] = True
+    return result
+
+
+def check_executable_confirm_guard(command: str, *, approval_callback=None) -> dict | None:
+    """Return a one-shot decision for a matching executable, else ``None``."""
+    executable = _match_executable_confirm_rule(command)
+    if executable is None:
+        return None
+    return _run_executable_confirm_gate(executable, command, approval_callback=approval_callback)
+
+
 def _floor_block(command: str, *, sudo_guard: bool = False) -> dict | None:
     """Unconditional floors, BEFORE yolo / mode=off / cron approve-mode so no
     session-level setting can bypass them: hardline catastrophic commands,
@@ -1223,6 +1293,11 @@ def check_dangerous_command(command: str, env_type: str,
     blocked = _floor_block(command)
     if blocked is not None:
         return blocked
+    executable_confirm = check_executable_confirm_guard(
+        command, approval_callback=approval_callback,
+    )
+    if executable_confirm is not None:
+        return executable_confirm
     if _yolo_active() or approval_context._get_approval_mode() == "off":
         return _approved()
     if _command_matches_permanent_allowlist(command):
@@ -1290,6 +1365,12 @@ def check_all_command_guards(command: str, env_type: str,
     prepared = consume_prepared_guard(command, env_type, has_host_access)
     if prepared is not None:
         return prepared
+
+    executable_confirm = check_executable_confirm_guard(
+        command, approval_callback=approval_callback,
+    )
+    if executable_confirm is not None:
+        return executable_confirm
 
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":
@@ -1365,6 +1446,10 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
         return _approved()
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _approved()
+    confirmed_executable = _match_execute_code_confirm_rule(code)
+    if confirmed_executable is not None:
+        command = f"execute_code <<'PY'\n{code}\nPY"
+        return _run_executable_confirm_gate(confirmed_executable, command)
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":
         return _approved()

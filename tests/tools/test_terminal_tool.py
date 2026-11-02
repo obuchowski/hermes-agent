@@ -1,4 +1,6 @@
-"""Regression tests for sudo detection and sudo password handling."""
+"""Regression tests for sudo detection and terminal approval payloads."""
+
+import json
 
 from tools import terminal_tool
 from tools import terminal_tool_sudo
@@ -25,6 +27,40 @@ def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):
 
 
 
+
+def test_pending_approval_preserves_one_shot_policy(monkeypatch):
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda *_args, **_kwargs: {
+            "approved": False,
+            "status": "pending_approval",
+            "command": "aws s3 ls",
+            "description": "AWS confirmation",
+            "pattern_key": "executable-confirm:aws",
+            "allow_permanent": False,
+            "one_shot_only": True,
+            "choices": ["once", "deny"],
+        },
+    )
+
+    payload = json.loads(terminal_tool.terminal_tool("aws s3 ls"))
+
+    assert payload["status"] == "pending_approval"
+    assert payload["allow_permanent"] is False
+    assert payload["one_shot_only"] is True
+    assert payload["choices"] == ["once", "deny"]
+
+
+def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+
+    command = "printf '%s\\n' sudo"
+    transformed, sudo_stdin = terminal_tool_sudo._transform_sudo_command(command)
+
+    assert transformed == command
+    assert sudo_stdin is None
 
 
 

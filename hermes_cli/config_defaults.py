@@ -1644,6 +1644,12 @@ DEFAULT_CONFIG = {
     # timeout: seconds before an unanswered prompt fails closed (CLI and gateway). 60s
     #   proved too tight for Telegram/Discord push notifications, hence 300.
     "approvals": {
+        # Per-executable one-shot confirmation rules. These run after the
+        # hardline/deny floors but before YOLO, mode=off, allowlists, smart
+        # approval, and unattended approval modes. Matching host-side
+        # invocations require a fresh human decision; headless runs fail closed.
+        # Example: [{"executable": "aws"}]
+        "confirm": [],
         # single_query_mode — what to do when a single-query (-q) session hits a dangerous command. -q runs
         # export HERMES_INTERACTIVE=1 (for interactive sudo prompts) but have NO user waiting to answer
         # approval prompts — an unanswered prompt just waits the full timeout then fails closed, so the

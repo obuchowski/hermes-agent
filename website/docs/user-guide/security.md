@@ -36,6 +36,7 @@ approvals:
   cron_mode: deny                 # deny | approve — what cron jobs do when they hit a dangerous command
   single_query_mode: deny         # deny | approve — what single-query (-q) sessions do on a dangerous command
   unattended_mode: deny           # deny | approve — what webhook/API sessions do on a dangerous command
+  confirm: []                     # executables that always need one-shot human approval
   mcp_reload_confirm: true        # /reload-mcp asks before invalidating the MCP tool cache
   destructive_slash_confirm: true # /clear, /new, /reset, /undo prompt before discarding state
 ```
@@ -51,6 +52,7 @@ The full set of keys:
 | `single_query_mode` | `deny` | How one-shot [`hermes chat -q`](./cli.md) sessions behave when they trigger a dangerous-command prompt. A `-q` session runs a single turn and exits with no user waiting to answer prompts; `deny` blocks the command (the agent must find another path), `approve` auto-approves everything in single-query context. Mirrors `cron_mode`. |
 | `unattended_mode` | `deny` | How sessions on unattended programmatic platforms (webhook, msgraph_webhook, api_server) behave when they trigger a dangerous-command prompt. These surfaces have no human who can answer `/approve`, so instead of blocking for the full approval timeout, `deny` blocks the command instantly (the agent must find another path) and `approve` auto-approves everything in unattended context. Exception: an api_server session whose client can answer the card (`/v1/runs` and streaming chat completions, via `POST /v1/runs/{id}/approval`) still gets the approval request. Mirrors `cron_mode`. |
 | `approvers` | `["*"]` | Who may answer a pending approval from a messaging chat. `["*"]`: any admitted member. `[]` or a list of user ids: the requester, those ids and the platform admins only — see [Who can answer an approval in a shared chat](#who-can-answer-an-approval-in-a-shared-chat-approvalsapprovers). |
+| `confirm` | `[]` | Executable rules that require fresh, one-shot human approval even when ordinary approvals are bypassed. Headless matches fail closed. |
 | `mcp_reload_confirm` | `true` | When true, `/reload-mcp` asks before rebuilding the MCP tool set. Rebuilding invalidates the provider prompt cache (tool schemas live in the system prompt), so the next message re-sends full input tokens. Users who click **Always Approve** flip this key to `false`. |
 | `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. The TUI also honors this setting for its `/clear`, `/new`, and `/reset` modal; `HERMES_TUI_NO_CONFIRM=1` force-skips that modal regardless of the configured value. |
 
@@ -58,15 +60,15 @@ The full set of keys:
 |------|----------|
 | **smart** (default) | Use an auxiliary LLM to assess risk. Low-risk commands (e.g., `python -c "print('hello')"`) are auto-approved for that command only. Genuinely dangerous commands are auto-denied. Uncertain cases escalate to a manual prompt. |
 | **manual** | Always prompt the user for approval on dangerous commands. |
-| **off** | Disable all approval checks — equivalent to running with `--yolo`. All commands execute without prompts, and write calls on `trust: untrusted` MCP servers run without the trust prompt. An MCP server's declared spend limit still asks (see [YOLO mode](#yolo-mode)). |
+| **off** | Disable ordinary approval checks — equivalent to running with `--yolo`. All commands execute without prompts, and write calls on `trust: untrusted` MCP servers run without the trust prompt. The hardline floor, `approvals.deny`, `approvals.confirm`, and an MCP server's declared spend limit still apply (see [YOLO mode](#yolo-mode)). |
 
 :::warning
-Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
+Setting `approvals.mode: off` disables ordinary safety prompts. Always-on hardline, deny, and executable-confirm policy remains active. Use only in trusted environments (CI/CD, containers, etc.).
 :::
 
 ### YOLO Mode
 
-YOLO mode bypasses **all** dangerous command approval prompts for the current session. It can be activated three ways:
+YOLO mode bypasses ordinary dangerous command approval prompts for the current session. Always-on hardline blocks, `approvals.deny`, and `approvals.confirm` remain active. YOLO can be activated three ways:
 
 1. **CLI flag**: Start a session with `hermes --yolo` or `hermes chat --yolo`
 2. **Slash command**: Type `/yolo` during a session to toggle it on/off
@@ -90,7 +92,7 @@ When YOLO is active, Hermes shows two persistent visual reminders so it's hard t
 - A `⚠ YOLO` fragment in the status bar across all width tiers, updated live as you toggle YOLO on or off (rich-text renderer and plain-text fallback).
 
 :::danger
-YOLO mode disables **all** dangerous command safety checks for the session — **except** the hardline blocklist (see below). Use only when you fully trust the commands being generated (e.g., well-tested automation scripts in disposable environments).
+YOLO mode disables ordinary dangerous command safety checks for the session — **except** the hardline blocklist, `approvals.deny`, and `approvals.confirm` (see below). Use only when you fully trust the commands being generated (e.g., well-tested automation scripts in disposable environments).
 :::
 
 YOLO and `approvals.mode: off` also skip the [`trust: untrusted`](../reference/mcp-config-reference.md) MCP prompt: a write-capable tool on an untrusted server runs without asking, with each source's usual reach. `/yolo` covers only the chat it was typed in (another chat is still asked); `--yolo` and `HERMES_YOLO_MODE` cover the sessions of the Hermes process they were given to; `approvals.mode: off` covers every chat and cron job of that profile. They do **not** skip:
@@ -190,6 +192,28 @@ Like the rest of the approval config, changes take effect immediately (the confi
 :::note Threat model
 Deny rules are a shell-command policy, not a complete shell interpreter or an OS capability sandbox. Normalization does not resolve arbitrary variables (including GNU `env -S` `${NAME}` expansion), aliases, functions, renamed binaries, scripts, interpreter programs, or every shell/launcher grammar (for example, case-pattern syntax, clustered launcher options, or options embedded inside an `env -S` string). Do not use a basename deny rule as a guarantee that a capability cannot be reached by other means. For containment, use OS permissions and an isolated backend with appropriately restricted mounts, credentials, and network access. This matching behavior does not change the configured approval mode or the empty-deny-list default.
 :::
+
+### Executable Confirmation Rules (`approvals.confirm`)
+
+`approvals.confirm` lets an operator keep YOLO behavior while requiring a human decision every time selected executables run. For example:
+
+```yaml
+approvals:
+  mode: off
+  cron_mode: approve
+  confirm:
+    - executable: aws
+```
+
+Rules are checked in this order: the built-in hardline floor and `approvals.deny` block first; executable confirmation runs next; only then do process/session YOLO, `mode: off`, command allowlists, smart approval, and `cron_mode` apply. Consequently, neither an existing session/permanent allowlist nor an **Approve session**/**Always approve** response can bypass a confirm rule.
+
+Each mapping needs one non-empty `executable` string. Matching is case-insensitive against the executable basename at real shell command positions. `aws`, `/usr/local/bin/aws`, `sudo aws`, `env AWS_PROFILE=prod aws`, pipelines, chains, and subshells match; arguments and similarly named programs such as `echo aws`, `aws-vault`, `myaws`, and `/tmp/aws-helper` do not. Malformed entries are ignored. Isolated container backends retain their existing guard bypass, but Docker sessions with host mounts are protected.
+
+Interactive CLI and gateway sessions receive the normal approval UI with only **Allow once** and **Deny**. The choice is never persisted, even if an older client sends `session` or `always`; the next invocation prompts again. The existing approval timeout still defaults to **300 seconds**, and a timeout denies the operation.
+
+Cron has no live approval surface, so a matching executable is **BLOCKED** even with `cron_mode: approve`. A headless non-interactive run without a gateway also fails closed. Non-matching dangerous cron commands retain the configured `cron_mode` behavior.
+
+For `execute_code`, Hermes parses the script with Python's `ast` module before the normal YOLO/mode-off bypass. It recognizes literal `subprocess.run`, `call`, `check_call`, `check_output`, and `Popen` calls whose list/tuple first item is a matching executable, literal shell commands passed with `shell=True`, and literal `os.system` shell commands. Standard `os`/`subprocess` import aliases and simple local bindings to literal command strings/lists are followed while respecting reassignment and scope shadowing. It does not execute or evaluate the script during inspection, and dynamic expressions, mere strings, comments, `boto3`, and invalid syntax are not inferred; calls through `hermes_tools.terminal` are guarded separately when terminal executes them.
 
 ### Approval Timeout
 

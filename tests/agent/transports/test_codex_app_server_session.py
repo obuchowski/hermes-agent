@@ -779,6 +779,62 @@ class TestServerRequestRouting:
         s.run_turn("hi", turn_timeout=0.2)
         assert ("r1", {"decision": "accept"}) in client.responses
 
+    @pytest.mark.parametrize(
+        ("confirm_result", "expected_decision"),
+        [({"approved": True}, "accept"), ({"approved": False}, "decline")],
+    )
+    def test_executable_confirm_overrides_auto_approve(
+        self, confirm_result, expected_decision
+    ):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval", request_id="aws-1",
+            command="aws sts get-caller-identity", cwd="/tmp",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        seen = []
+
+        def confirm(command):
+            seen.append(command)
+            return confirm_result
+
+        s = make_session(
+            client,
+            executable_confirm_callback=confirm,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        )
+        s.run_turn("hi", turn_timeout=1.0)
+        assert seen == ["aws sts get-caller-identity"]
+        assert ("aws-1", {"decision": expected_decision}) in client.responses
+
+    def test_nonmatching_executable_confirm_keeps_auto_approve(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval", request_id="safe-1",
+            command="echo aws", cwd="/tmp",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        seen = []
+
+        def confirm(command):
+            seen.append(command)
+            return None
+
+        s = make_session(
+            client,
+            executable_confirm_callback=confirm,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        )
+        s.run_turn("hi", turn_timeout=1.0)
+        assert seen == ["echo aws"]
+        assert ("safe-1", {"decision": "accept"}) in client.responses
+
 
 
 # ---- enriched approval prompts ----

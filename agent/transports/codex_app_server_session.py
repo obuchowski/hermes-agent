@@ -212,6 +212,9 @@ class CodexAppServerSession:
         self, *, cwd: Optional[str] = None, codex_bin: str = "codex",
         codex_home: Optional[str] = None, permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
+        executable_confirm_callback: Optional[
+            Callable[[str], Optional[dict]]
+        ] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
@@ -244,6 +247,7 @@ class CodexAppServerSession:
             os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"), "workspace-write"
         )
         self._approval_callback = approval_callback
+        self._executable_confirm_callback = executable_confirm_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
@@ -746,12 +750,24 @@ class CodexAppServerSession:
             return "decline"
 
     def _decide_exec_approval(self, params: dict) -> str:
+        command = params.get("command") or ""
+        if self._executable_confirm_callback is not None:
+            try:
+                confirm_result = self._executable_confirm_callback(command)
+            except Exception:
+                logger.exception(
+                    "executable confirm callback raised on codex exec request"
+                )
+                return "decline"
+            if confirm_result is not None:
+                return "accept" if confirm_result.get("approved") else "decline"
+
         def prompt() -> tuple[str, str]:
             # ``cwd`` is Optional on codex's side; fall back so the prompt is never empty.
             description = f"Codex requests exec in {params.get('cwd') or self._cwd or '<unknown>'}"
             if params.get("reason"):
                 description += f" — {params['reason']}"
-            return params.get("command") or "", description
+            return command, description
 
         return self._run_approval_callback(self._routing.auto_approve_exec, prompt, "exec request")
 
