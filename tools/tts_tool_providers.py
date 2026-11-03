@@ -623,5 +623,8 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: dict[str, Any]
         samples = array.array("h", pcm[: len(pcm) - tail])
         for i in range(fade):
             samples[-fade + i] = int(samples[-fade + i] * (fade - 1 - i) / fade)
+        # Leading click: fade in the first 20 ms instead of cutting speech.
+        for i in range(480):
+            samples[i] = int(samples[i] * i / 480)
         pcm = samples.tobytes()
     return _write_wav_bytes_as(_wrap_pcm_as_wav(pcm), output_path)
