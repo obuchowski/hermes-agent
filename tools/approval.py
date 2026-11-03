@@ -1240,7 +1240,7 @@ def _run_executable_confirm_gate(executable: str, display_target: str, *, approv
     result = _human_decision(
         _COMMAND_GATE, command=display_target, description=description,
         pattern_key=pattern_key, pattern_keys=[pattern_key],
-        warnings=[(pattern_key, None, False)], session_key=get_current_session_key(),
+        session_key=get_current_session_key(),
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway,
         is_ask=is_ask, one_shot_only=True,
     )
