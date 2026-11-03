@@ -62,6 +62,14 @@ _MAX_LITERAL_SHELL_RECURSION = 8
 _AMBIGUOUS_LITERAL_SHELL_COMMAND = object()
 
 
+class UnresolvedExecutable(str):
+    """Fail-closed match: the real executable is not literal (``$X``, backticks, deep nesting)."""
+
+
+def _unresolved(executables: set[str]) -> str:
+    return UnresolvedExecutable(min(executables))
+
+
 def _literal_shell_word_value(word: str) -> str | None:
     """Decode one literal shell word without performing expansions."""
     try:
@@ -145,14 +153,14 @@ def _match_literal_shell_executable(
         # We reached this point only through a literal shell ``-c`` chain.
         # Refuse to let excessive nesting turn a configured confirmation rule
         # into a bypass: ambiguity beyond the parser bound fails closed.
-        return min(executables)
+        return _unresolved(executables)
 
     for _start, executable_end, word in _iter_shell_command_word_spans(command):
         candidate = _executable_basename(
             _deobfuscate_shell_word_for_detection(word)
         )
         if candidate.startswith(("$", "`")):
-            return min(executables)
+            return _unresolved(executables)
         if candidate in executables:
             return candidate
         if candidate == "env":
@@ -170,12 +178,12 @@ def _match_literal_shell_executable(
 
         script = _literal_shell_command_after_c(command, executable_end)
         if script is _AMBIGUOUS_LITERAL_SHELL_COMMAND:
-            return min(executables)
+            return _unresolved(executables)
         if not script:
             continue
         assert isinstance(script, str)
         if script.lstrip().startswith(("$", "`")):
-            return min(executables)
+            return _unresolved(executables)
         nested_match = _match_literal_shell_executable(
             script,
             executables,
