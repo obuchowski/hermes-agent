@@ -257,12 +257,12 @@ def _wrap_pcm_as_wav(
     return riff_header + fmt_chunk + data_chunk_header + pcm_bytes
 
 
-def _write_wav_bytes_as(wav_bytes: bytes, output_path: str) -> str:
+def _write_wav_bytes_as(wav_bytes: bytes, output_path: str, speed: float = 1.0) -> str:
     """Write in-memory WAV to *output_path*, ffmpeg-converting to its container. ``.ogg`` is forced
     to Opus (ffmpeg's .ogg default is Vorbis, which voice bubbles reject). A failed conversion
     raises RuntimeError; without ffmpeg the raw WAV is written under the requested name
     (misleading extension, but the audio still plays)."""
-    if output_path.lower().endswith(".wav"):
+    if output_path.lower().endswith(".wav") and speed == 1.0:
         with open(output_path, "wb") as f:
             f.write(wav_bytes)
         return output_path
@@ -273,8 +273,9 @@ def _write_wav_bytes_as(wav_bytes: bytes, output_path: str) -> str:
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             opus = _OPUS_VOICE_ARGS if output_path.lower().endswith(".ogg") else []
+            tempo = ["-filter:a", f"atempo={speed}"] if speed != 1.0 else []
             result = _ffmpeg_run(
-                ffmpeg, ["-i", wav_path, *opus, "-y", "-loglevel", "error", output_path])
+                ffmpeg, ["-i", wav_path, *tempo, *opus, "-y", "-loglevel", "error", output_path])
             if result.returncode != 0:
                 stderr = result.stderr.decode("utf-8", errors="ignore")[:300]
                 raise RuntimeError(f"ffmpeg conversion failed: {stderr}")

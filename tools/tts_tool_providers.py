@@ -627,4 +627,5 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: dict[str, Any]
         for i in range(480):
             samples[i] = int(samples[i] * i / 480)
         pcm = samples.tobytes()
-    return _write_wav_bytes_as(_wrap_pcm_as_wav(pcm), output_path)
+    speed = min(max(float(gemini_config.get("speed", tts_config.get("speed", 1.0)) or 1.0), 0.5), 2.0)
+    return _write_wav_bytes_as(_wrap_pcm_as_wav(pcm), output_path, speed)
