@@ -42,6 +42,7 @@ from tools.approval_confirm import (
     _MAX_LITERAL_SHELL_RECURSION,
     _match_execute_code_confirm_rule,
     _match_executable_confirm_rule,
+    UnresolvedExecutable,
 )
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
 from tools.approval_smart import _smart_verdict
@@ -1210,10 +1211,17 @@ def _user_deny_block(command: str) -> dict | None:
 def _run_executable_confirm_gate(executable: str, display_target: str, *, approval_callback=None) -> dict:
     """Require one fresh human decision for a configured executable."""
     pattern_key = f"executable-confirm:{executable}"
-    description = (
-        f"approvals.confirm requires explicit approval for executable '{executable}' "
-        "on every invocation"
-    )
+    if isinstance(executable, UnresolvedExecutable):
+        description = (
+            "approvals.confirm: the executable cannot be determined literally "
+            f"(variable, substitution or deep nesting), so rule '{executable}' applies; "
+            "explicit approval required"
+        )
+    else:
+        description = (
+            f"approvals.confirm requires explicit approval for executable '{executable}' "
+            "on every invocation"
+        )
     # Explicit unattended markers beat inherited interactive flags. In particular,
     # cron and -q cannot accidentally grow a live approval surface.
     contexts = _unattended_contexts()
