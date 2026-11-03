@@ -614,4 +614,14 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: dict[str, Any]
         raise RuntimeError(f"Gemini TTS response was malformed: {e}") from e
     if not audio_b64:
         raise RuntimeError("Gemini TTS returned empty audio data")
-    return _write_wav_bytes_as(_wrap_pcm_as_wav(base64.b64decode(audio_b64)), output_path)
+    pcm = base64.b64decode(audio_b64)
+    # Gemini TTS appends a short static burst to every clip: drop the last 250 ms
+    # and fade out the 50 ms before the cut (24 kHz mono 16-bit).
+    tail, fade = 6000 * 2, 1200
+    if len(pcm) > tail + fade * 2 * 4:
+        import array
+        samples = array.array("h", pcm[: len(pcm) - tail])
+        for i in range(fade):
+            samples[-fade + i] = int(samples[-fade + i] * (fade - 1 - i) / fade)
+        pcm = samples.tobytes()
+    return _write_wav_bytes_as(_wrap_pcm_as_wav(pcm), output_path)
