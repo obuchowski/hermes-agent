@@ -76,7 +76,7 @@ def _gateway_resolver(choice: str, seen: list[dict]):
 
 def _run_in_gateway(command: str, choice: str) -> tuple[dict, list[dict]]:
     seen: list[dict] = []
-    token = approval.set_current_session_key(SESSION_KEY)
+    token = approval_context.set_current_session_key(SESSION_KEY)
     approval.register_gateway_notify(
         SESSION_KEY, _gateway_resolver(choice, seen)
     )
@@ -84,13 +84,13 @@ def _run_in_gateway(command: str, choice: str) -> tuple[dict, list[dict]]:
         result = approval.check_all_command_guards(command, "local")
     finally:
         approval.unregister_gateway_notify(SESSION_KEY)
-        approval.reset_current_session_key(token)
+        approval_context.reset_current_session_key(token)
     return result, seen
 
 
 def _run_code_in_gateway(code: str, choice: str) -> tuple[dict, list[dict]]:
     seen: list[dict] = []
-    token = approval.set_current_session_key(SESSION_KEY)
+    token = approval_context.set_current_session_key(SESSION_KEY)
     approval.register_gateway_notify(
         SESSION_KEY, _gateway_resolver(choice, seen)
     )
@@ -98,7 +98,7 @@ def _run_code_in_gateway(code: str, choice: str) -> tuple[dict, list[dict]]:
         result = approval.check_execute_code_guard(code, "local")
     finally:
         approval.unregister_gateway_notify(SESSION_KEY)
-        approval.reset_current_session_key(token)
+        approval_context.reset_current_session_key(token)
     return result, seen
 
 
@@ -372,7 +372,7 @@ def test_process_and_session_yolo_do_not_bypass_confirm(
     confirm_config, monkeypatch, bypass
 ):
     _interactive(monkeypatch)
-    token = approval.set_current_session_key(SESSION_KEY)
+    token = approval_context.set_current_session_key(SESSION_KEY)
     try:
         if bypass == "process":
             monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", True)
@@ -384,7 +384,7 @@ def test_process_and_session_yolo_do_not_bypass_confirm(
             approval_callback=lambda *_args, **_kwargs: "deny",
         )
     finally:
-        approval.reset_current_session_key(token)
+        approval_context.reset_current_session_key(token)
 
     assert result["approved"] is False
     assert "denied" in result["message"].lower()
@@ -394,7 +394,7 @@ def test_session_and_permanent_allowlists_do_not_bypass_confirm(
     confirm_config, monkeypatch
 ):
     _interactive(monkeypatch)
-    token = approval.set_current_session_key(SESSION_KEY)
+    token = approval_context.set_current_session_key(SESSION_KEY)
     approval.approve_session(SESSION_KEY, CONFIRM_KEY)
     approval.approve_permanent("aws s3 ls")
     try:
@@ -404,7 +404,7 @@ def test_session_and_permanent_allowlists_do_not_bypass_confirm(
             approval_callback=lambda *_args, **_kwargs: "deny",
         )
     finally:
-        approval.reset_current_session_key(token)
+        approval_context.reset_current_session_key(token)
 
     assert result["approved"] is False
 
@@ -488,7 +488,7 @@ def test_interactive_session_and_always_choices_never_persist(
     confirm_config, monkeypatch, choice
 ):
     _interactive(monkeypatch)
-    token = approval.set_current_session_key(SESSION_KEY)
+    token = approval_context.set_current_session_key(SESSION_KEY)
     calls = 0
 
     def choose_scope(*_args, **_kwargs):
@@ -504,7 +504,7 @@ def test_interactive_session_and_always_choices_never_persist(
             "aws s3 ls", "local", approval_callback=choose_scope
         )
     finally:
-        approval.reset_current_session_key(token)
+        approval_context.reset_current_session_key(token)
 
     assert first["approved"] is True
     assert second["approved"] is False
